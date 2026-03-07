@@ -1,3 +1,6 @@
+# MCP config (may contain credentials)
+.mcp.json
+
 # Python
 __pycache__/
 *.py[cod]

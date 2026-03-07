@@ -10,7 +10,6 @@ from mancp.store import (
     collect_all_from_claude_json,
     collect_readonly_mcps,
     count_mcp_tools,
-    estimate_mcp_tokens,
     get_plugins,
     get_project_scope_mcps,
     get_user_scope_mcps,
@@ -19,7 +18,7 @@ from mancp.store import (
     remove_mcp_everywhere,
     save_store,
     set_plugin_enabled,
-    token_warning_level,
+    tool_count_for,
 )
 
 
@@ -224,14 +223,12 @@ def test_count_mcp_tools_empty_dir(tmp_path):
 # ── token estimates ──────────────────────────────────────────────────────────
 
 
-def test_estimate_mcp_tokens():
-    assert estimate_mcp_tokens(10) == 3000
-
-
-def test_token_warning_level():
-    assert token_warning_level(1000) == "low"
-    assert token_warning_level(3000) == "medium"
-    assert token_warning_level(6000) == "high"
+def test_tool_count_for():
+    counts = {"my_mcp": 5, "other": 10}
+    assert tool_count_for("my_mcp", counts) == 5
+    # hyphen-to-underscore fallback
+    assert tool_count_for("my-mcp", counts) == 5
+    assert tool_count_for("unknown", counts) == 0
 
 
 # ── scope helpers ────────────────────────────────────────────────────────────

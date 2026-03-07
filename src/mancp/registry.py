@@ -1,4 +1,4 @@
-"""Search MCP server registries and discover popular servers."""
+"""Search MCP server registries and discover servers."""
 
 import json
 import os
@@ -48,6 +48,23 @@ def _github_headers() -> dict[str, str]:
     return headers
 
 
+_SERVER_PREFIXES = ("mcp-server-", "server-", "mcp-")
+_SERVER_SUFFIXES = ("-mcp-server", "-mcp")
+
+
+def normalize_server_name(name: str) -> str:
+    """Strip common MCP server prefixes and suffixes to get a short name."""
+    for prefix in _SERVER_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    for suffix in _SERVER_SUFFIXES:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    return name
+
+
 @dataclass
 class MCPServerResult:
     """A search result from a registry."""
@@ -81,6 +98,184 @@ class MCPServerResult:
         return f"{self.name:<30} {self.description[:50]}{stars}"
 
 
+def _mcp_inspect_stdio(command: str, args: list, env: dict | None = None, timeout: int = 15) -> int | None:
+    """Start a stdio MCP server, call tools/list, return tool count.
+
+    Speaks the MCP JSON-RPC protocol: initialize -> tools/list -> count.
+    Returns None on failure.
+    """
+    full_env = {**os.environ, **(env or {})}
+
+    try:
+        proc = subprocess.Popen(
+            [command, *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=full_env,
+        )
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+    def _send(msg: dict) -> None:
+        line = json.dumps(msg) + "\n"
+        proc.stdin.write(line.encode())
+        proc.stdin.flush()
+
+    def _recv() -> dict | None:
+        """Read one JSON-RPC response, skipping notifications."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                return None
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                # Skip notifications (no "id" field)
+                if "id" in msg:
+                    return msg
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    try:
+        # Initialize
+        _send({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "mancp", "version": "0.1.0"},
+            },
+        })
+        init_resp = _recv()
+        if not init_resp or "error" in init_resp:
+            return None
+
+        # Send initialized notification
+        _send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        # List tools
+        _send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        tools_resp = _recv()
+        if not tools_resp or "error" in tools_resp:
+            return None
+
+        tools = tools_resp.get("result", {}).get("tools", [])
+        return len(tools)
+    except (OSError, BrokenPipeError):
+        return None
+    finally:
+        try:
+            proc.stdin.close()
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+
+
+def _mcp_inspect_http(url: str, env: dict | None = None, timeout: int = 10) -> int | None:
+    """Connect to a streamable-http MCP server and call tools/list."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "User-Agent": "mancp",
+    }
+    # Some servers use env vars for auth tokens — check common patterns
+    if env:
+        for key, val in env.items():
+            k = key.upper()
+            if "TOKEN" in k or "KEY" in k or "SECRET" in k or "AUTH" in k:
+                headers.setdefault("Authorization", f"Bearer {val}")
+                break
+
+    def _post(msg: dict) -> dict | None:
+        data = json.dumps(msg).encode()
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                # Handle SSE responses (data: {...})
+                for line in body.splitlines():
+                    if line.startswith("data: "):
+                        return json.loads(line[6:])
+                # Try plain JSON
+                return json.loads(body)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            return None
+
+    # Initialize
+    init_resp = _post({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "mancp", "version": "0.1.0"},
+        },
+    })
+    if not init_resp or "error" in init_resp:
+        return None
+
+    # List tools
+    tools_resp = _post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    if not tools_resp or "error" in tools_resp:
+        return None
+
+    tools = tools_resp.get("result", {}).get("tools", [])
+    return len(tools)
+
+
+def inspect_mcp_tool_count(cfg: dict) -> int | None:
+    """Inspect an MCP server config to get its actual tool count.
+
+    Starts the server (stdio) or connects (http), calls tools/list, returns count.
+    """
+    url = cfg.get("url", "")
+    command = cfg.get("command", "")
+    args = cfg.get("args", [])
+    env = cfg.get("env", None)
+
+    if url:
+        return _mcp_inspect_http(url, env)
+    if command:
+        return _mcp_inspect_stdio(command, args, env)
+    return None
+
+
+def fetch_tool_counts_for_configs(configs: dict[str, dict]) -> dict[str, int]:
+    """Inspect MCP servers to get actual tool counts via the MCP protocol.
+
+    Starts each server (or connects via HTTP), calls tools/list, and returns
+    {name: tool_count}. Runs in parallel with a timeout per server.
+    """
+    if not configs:
+        return {}
+
+    results: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(inspect_mcp_tool_count, cfg): name
+            for name, cfg in configs.items()
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                count = future.result()
+                if count is not None and count > 0:
+                    results[name] = count
+                    # Also cache by safe package identifiers for lookup
+                    cfg = configs[name]
+                    for arg in cfg.get("args", []):
+                        if isinstance(arg, str) and arg.startswith("@"):
+                            results[arg] = count
+            except Exception:
+                continue
+    return results
+
+
 def search_github_mcp_org(query: str, size: int = 15) -> list[MCPServerResult]:
     """Search GitHub for repos in the modelcontextprotocol org matching query."""
     params = urllib.parse.urlencode({
@@ -103,13 +298,7 @@ def search_github_mcp_org(query: str, size: int = 15) -> list[MCPServerResult]:
         full_name = repo.get("full_name", "")
         desc = repo.get("description", "") or ""
 
-        short = name
-        if short.startswith("server-"):
-            short = short[len("server-"):]
-        elif short.startswith("mcp-server-"):
-            short = short[len("mcp-server-"):]
-        elif short.endswith("-mcp-server"):
-            short = short[:-len("-mcp-server")]
+        short = normalize_server_name(name)
 
         results.append(MCPServerResult(
             name=short,
@@ -154,14 +343,7 @@ def search_mcp_registry(query: str, size: int = 15) -> list[MCPServerResult]:
 
         # Derive short name from the registry name (e.g. "io.github.user/mcp-server-foo")
         short = full_name.split("/")[-1] if "/" in full_name else full_name
-        for prefix in ("mcp-server-", "server-", "mcp-"):
-            if short.startswith(prefix):
-                short = short[len(prefix):]
-                break
-        for suffix in ("-mcp-server", "-mcp"):
-            if short.endswith(suffix):
-                short = short[:-len(suffix)]
-                break
+        short = normalize_server_name(short)
 
         # Get transport type, package identifier, and remote URL
         packages = server.get("packages", [])
@@ -234,8 +416,11 @@ def search_all(query: str, size: int = 10) -> list[MCPServerResult]:
 
     GitHub MCP org results shown first, then registry results.
     """
-    gh_results = search_github_mcp_org(query, size=size)
-    registry_results = search_mcp_registry(query, size=size)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        gh_future = pool.submit(search_github_mcp_org, query, size)
+        reg_future = pool.submit(search_mcp_registry, query, size)
+        gh_results = gh_future.result()
+        registry_results = reg_future.result()
 
     seen_short: set[str] = set()
     github_merged: list[MCPServerResult] = []
@@ -369,8 +554,7 @@ def fetch_awesome_categories() -> list[tuple[str, int]]:
 
     text = _fetch_awesome_readme()
     if not text:
-        # Fallback to hardcoded if fetch fails
-        return _FALLBACK_CATEGORIES
+        return []
 
     categories = _parse_awesome_readme(text)
     result = [
@@ -514,66 +698,7 @@ def _get_category_entries(category: str) -> list[CategoryEntry]:
     return categories.get(category, [])
 
 
-def fetch_popular_servers() -> list[DiscoverServer]:
-    """Fetch popular servers by getting top-starred repos across categories.
-
-    Picks repos from the largest categories and fetches GitHub details.
-    Cached for 24 hours.
-    """
-    cache_name = "awesome_popular"
-    if _cache_is_fresh(cache_name):
-        cached = _cache_read(cache_name)
-        if cached and isinstance(cached, list):
-            return [DiscoverServer(**s) for s in cached]
-
-    # Collect a sample of repos from top categories
-    text = _fetch_awesome_readme()
-    if not text:
-        return []
-
-    categories = _parse_awesome_readme(text)
-    # Pick first few entries from each large category
-    sample_entries: list[tuple[str, CategoryEntry]] = []
-    sorted_cats = sorted(categories.items(), key=lambda x: -len(x[1]))
-    for cat_name, entries in sorted_cats[:8]:
-        for entry in entries[:5]:
-            sample_entries.append((cat_name, entry))
-
-    if not sample_entries:
-        return []
-
-    # Fetch GitHub details in parallel
-    servers: list[DiscoverServer] = []
-    with ThreadPoolExecutor(max_workers=15) as pool:
-        futures = {
-            pool.submit(_fetch_github_repo, e.owner, e.repo): (cat, e)
-            for cat, e in sample_entries
-        }
-        for future in as_completed(futures):
-            cat, entry = futures[future]
-            gh_data = future.result()
-            servers.append(_entry_to_server(entry, gh_data, cat))
-
-    # Sort by stars and take top entries
-    servers.sort(key=lambda s: -s.stars)
-    servers = servers[:30]
-
-    # Only cache if most entries got GitHub data
-    enriched = sum(1 for s in servers if s.stars > 0)
-    if enriched > len(servers) // 2:
-        _cache_write(cache_name, [
-            {"name": s.name, "author": s.author, "description": s.description,
-             "url": s.url, "license": s.license, "category": s.category,
-             "stars": s.stars, "forks": s.forks, "language": s.language}
-            for s in servers
-        ])
-    return servers
-
-
-# Keep for backwards compat with old cache files
-def fetch_categories() -> list[tuple[str, int]]:
-    """Alias for fetch_awesome_categories."""
-    return fetch_awesome_categories()
+fetch_categories = fetch_awesome_categories
 
 
 # -- Skills: skills.sh integration --
@@ -782,29 +907,3 @@ def get_installed_skills() -> list[dict]:
     return installed
 
 
-# Fallback categories if README fetch fails
-_FALLBACK_CATEGORIES = [
-    ("Developer Tools", 219),
-    ("Finance & Fintech", 159),
-    ("Other Tools and Integrations", 148),
-    ("Search & Data Extraction", 109),
-    ("Databases", 98),
-    ("Knowledge & Memory", 79),
-    ("Security", 66),
-    ("Communication", 55),
-    ("Cloud Platforms", 52),
-    ("Aggregators", 45),
-    ("Coding Agents", 45),
-    ("Browser Automation", 38),
-    ("Art & Culture", 31),
-    ("Workplace & Productivity", 29),
-    ("Monitoring", 27),
-    ("Data Science Tools", 23),
-    ("Location Services", 22),
-    ("File Systems", 20),
-    ("Data Platforms", 16),
-    ("Gaming", 16),
-    ("Marketing", 16),
-    ("Version Control", 14),
-    ("Multimedia Process", 14),
-]

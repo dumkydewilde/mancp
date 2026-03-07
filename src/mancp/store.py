@@ -3,6 +3,7 @@
 import json
 import re
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -153,67 +154,30 @@ def categorize_readonly(readonly: dict[str, str]) -> dict[str, dict[str, str]]:
     return {k: v for k, v in cats.items() if v}
 
 
-# Known tool counts for common MCP servers/packages.
-# Keyed by command basename, URL pattern, or well-known name.
-# Counts based on actual tool definitions as of March 2026.
-KNOWN_TOOL_COUNTS: dict[str, int] = {
-    # Local / self-hosted
-    "github-mcp-server": 40,
-    "@modelcontextprotocol/server-github": 40,
-    "@modelcontextprotocol/server-filesystem": 11,
-    "@modelcontextprotocol/server-slack": 12,
-    "@modelcontextprotocol/server-postgres": 6,
-    "@modelcontextprotocol/server-sqlite": 6,
-    "@modelcontextprotocol/server-puppeteer": 8,
-    "@modelcontextprotocol/server-brave-search": 2,
-    "@modelcontextprotocol/server-google-maps": 5,
-    "@modelcontextprotocol/server-memory": 5,
-    "@modelcontextprotocol/server-sequential-thinking": 1,
-    "@anthropic/mcp-server-filesystem": 11,
-    "@anthropic/mcp-server-slack": 12,
-    "@bytebase/dbhub": 2,
-    "@bytebase/databasehub": 2,
-    "@flowbite/mcp": 2,
-    "flowbite-mcp": 2,
-    # Remote / URL-based
-    "api.motherduck.com/mcp": 15,
-    "mcp.mux.com": 96,
-    "ai.todoist.net/mcp": 10,
-    # claude.ai connectors
-    "claude.ai Gmail": 7,
-    "claude.ai Google Calendar": 9,
-    "claude.ai Guru": 6,
-    "claude.ai Linear": 42,
-    "claude.ai MotherDuck": 15,
-    "claude.ai MotherDuck Staging": 15,
-    "claude.ai MotherDuck Marketing MCP": 15,
-    "claude.ai Slack": 12,
-    "claude.ai Notion": 5,
-    "claude.ai HubSpot": 10,
-    "claude.ai HubSpot Spot": 3,
-    "claude.ai PostHog (Web Analytics)": 30,
-    "claude.ai Figma": 8,
-    "claude.ai Clay": 8,
-    "claude.ai Hex": 10,
-    "claude.ai Miro": 8,
-    "claude.ai Jira": 15,
-    "claude.ai Confluence": 10,
-    "claude.ai Asana": 12,
-    "claude.ai Intercom": 10,
-    "claude.ai Zendesk": 12,
-    "claude.ai Sentry": 10,
-    "claude.ai Datadog": 15,
-    "claude.ai PagerDuty": 8,
-    "claude.ai Stripe": 15,
-    "claude.ai Salesforce": 20,
-    # Plugins
-    "plugin:linear": 42,
-    "plugin:Notion": 5,
-    "plugin:figma": 3,
-    "plugin:playwright": 8,
-    # claude-in-chrome
-    "claude-in-chrome": 18,
-}
+TOOL_COUNTS_CACHE = CONFIG_DIR / "cache" / "tool_counts.json"
+TOOL_COUNTS_TTL = 86400 * 7  # 7 days
+
+
+def load_tool_counts_cache() -> dict[str, int]:
+    """Load cached tool counts from disk."""
+    if not TOOL_COUNTS_CACHE.exists():
+        return {}
+    try:
+        data = json.loads(TOOL_COUNTS_CACHE.read_text())
+        # Check TTL
+        ts = data.get("_updated", 0)
+        if time.time() - ts > TOOL_COUNTS_TTL:
+            return {}
+        return {k: v for k, v in data.items() if k != "_updated" and isinstance(v, int)}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_tool_counts_cache(counts: dict[str, int]) -> None:
+    """Persist tool counts cache to disk."""
+    TOOL_COUNTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    data = {**counts, "_updated": int(time.time())}
+    TOOL_COUNTS_CACHE.write_text(json.dumps(data, indent=2))
 
 
 def count_mcp_tools(claude_dir: Path = CLAUDE_DIR) -> dict[str, int]:
@@ -237,45 +201,60 @@ def count_mcp_tools(claude_dir: Path = CLAUDE_DIR) -> dict[str, int]:
     return counts
 
 
-def estimate_tool_count(name: str, cfg: dict, permission_counts: dict[str, int]) -> int:
+def estimate_tool_count(
+    name: str,
+    cfg: dict,
+    permission_counts: dict[str, int],
+    cached_counts: dict[str, int] | None = None,
+) -> int:
     """Estimate tool count for an MCP using multiple strategies.
 
-    1. Match command/URL against KNOWN_TOOL_COUNTS
-    2. Fall back to permission-based count from settings.local.json
+    1. Cached tool counts from source repo analysis (best estimate of total tools)
+    2. Permission-based count from settings.local.json (lower bound — only permitted tools)
     3. Return 0 if unknown
     """
-    # Try matching against known servers by command/args or URL
+    cache = cached_counts or {}
     cmd = cfg.get("command", "")
     url = cfg.get("url", "")
     args = cfg.get("args", [])
 
-    # Check URL patterns
+    # 1. Check cache by name
+    if name in cache:
+        return cache[name]
+
+    # 2. Check cache by URL pattern
     if url:
-        for pattern, count in KNOWN_TOOL_COUNTS.items():
+        for pattern, count in cache.items():
             if pattern in url:
                 return count
 
-    # Check command basename
+    # 3. Check cache by command basename
     cmd_base = cmd.rsplit("/", 1)[-1] if cmd else ""
-    if cmd_base in KNOWN_TOOL_COUNTS:
-        return KNOWN_TOOL_COUNTS[cmd_base]
+    if cmd_base and cmd_base in cache:
+        return cache[cmd_base]
 
-    # Check args for package names (npm @scope/pkg or plain names)
+    # 4. Check cache by args (npm package names etc.)
     for arg in args:
-        if isinstance(arg, str) and arg in KNOWN_TOOL_COUNTS:
-            return KNOWN_TOOL_COUNTS[arg]
+        if isinstance(arg, str) and arg in cache:
+            return cache[arg]
 
-    # Check name directly (for cloud connectors, plugins)
-    if name in KNOWN_TOOL_COUNTS:
-        return KNOWN_TOOL_COUNTS[name]
-
-    # Fall back to permission counts
+    # 5. Fall back to permission counts (lower bound: only tools user has allowed)
     if name in permission_counts:
         return permission_counts[name]
     alt = name.replace("-", "_")
     if alt in permission_counts:
         return permission_counts[alt]
 
+    return 0
+
+
+def tool_count_for(name: str, tool_counts: dict[str, int]) -> int:
+    """Look up tool count for an MCP by name, trying hyphen/underscore variants."""
+    if name in tool_counts:
+        return tool_counts[name]
+    alt = name.replace("-", "_")
+    if alt in tool_counts:
+        return tool_counts[alt]
     return 0
 
 

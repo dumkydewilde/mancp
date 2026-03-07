@@ -18,12 +18,13 @@ from mancp.registry import (
     Skill,
     fetch_categories,
     fetch_category_servers,
-    fetch_popular_servers,
     fetch_skill_description,
     fetch_skills_discover,
+    fetch_tool_counts_for_configs,
     get_category_total,
     get_installed_skills,
     is_in_store,
+    normalize_server_name,
     search_all,
     search_skills,
 )
@@ -37,14 +38,16 @@ from mancp.store import (
     get_plugins,
     get_project_scope_mcps,
     get_user_scope_mcps,
-    KNOWN_TOOL_COUNTS,
     load_settings,
+    load_tool_counts_cache,
     mask_secrets,
     remove_mcp_everywhere,
     save_settings,
     save_store,
+    save_tool_counts_cache,
     apply_changes,
     token_warning_level,
+    tool_count_for,
     CLAUDE_DIR,
     SETTINGS_JSON,
     STORE_FILE,
@@ -56,13 +59,7 @@ BADGE_WIDTH = 4  # right-aligned token badge column
 
 def _discover_server_in_store(server: DiscoverServer, store: dict) -> bool:
     """Check if a DiscoverServer matches any entry in the store."""
-    short = server.name
-    for pfx in ("mcp-server-", "mcp-"):
-        if short.startswith(pfx):
-            short = short[len(pfx):]
-    for sfx in ("-mcp-server", "-mcp"):
-        if short.endswith(sfx):
-            short = short[:-len(sfx)]
+    short = normalize_server_name(server.name)
     if short in store or server.name in store:
         return True
     full_pkg = f"{server.author}/{server.name}".lower() if server.author else ""
@@ -307,7 +304,7 @@ class MoreRow(Widget):
     def __init__(self, label: str = "more...", section: str = ""):
         super().__init__()
         self.label = label
-        self.section = section  # "popular" or "category"
+        self.section = section  # "category"
 
     def render(self) -> str:
         cursor = "[bold]>[/] " if self.focused else "  "
@@ -866,6 +863,7 @@ class ManCPApp(App):
         self.plugins = get_plugins(self.settings_json)
         self.readonly_mcps = collect_readonly_mcps(self.claude_dir)
         self.tool_counts = count_mcp_tools(self.claude_dir)
+        self.cached_tool_counts = load_tool_counts_cache()
         self.names = sorted(store.keys())
         self.plugin_ids = sorted(self.plugins.keys())
         self.cursor = 0
@@ -876,8 +874,6 @@ class ManCPApp(App):
         self.discover_servers: list[DiscoverServer] = []
         self.discover_view = "categories"  # "categories" or "servers"
         self.discover_category: str = ""
-        self.discover_popular_all: list[DiscoverServer] = []  # full popular list
-        self.discover_popular_shown = 8  # how many popular shown
         self.discover_cat_offset: int = 0  # pagination offset for category
         self.discover_cat_total: int = 0  # total entries in category
         self._input_focused = False
@@ -890,7 +886,7 @@ class ManCPApp(App):
 
         # -- Servers tab --
         yield Label(
-            "  [bold]U[/]  [bold]P[/]  name                       [bold]~tok[/]  command / url",
+            "  [bold]U[/]  [bold]P[/]  name                        [bold]ctx[/]  command / url",
             id="col-header",
         )
         with ScrollableContainer(id="mcp-list", can_focus=False):
@@ -920,7 +916,7 @@ class ManCPApp(App):
 
         # -- Discover tab (hidden initially) --
         with Vertical(id="discover-panel", classes="hidden"):
-            yield Static("  [dim]Loading popular servers...[/dim]", id="discover-status")
+            yield Static("  [bold]Discover MCP servers[/bold]", id="discover-status")
             yield Label(
                 f"     {'name':<{NAME_WIDTH}}     [bold]★[/]  [bold]lang[/]  description",
                 id="discover-col-header",
@@ -935,6 +931,34 @@ class ManCPApp(App):
 
         yield Static("", id="status-bar")
         yield Label(self._footer_for_tab(), id="footer-hints")
+
+    def on_mount(self):
+        # Fetch tool counts from source repos in background for servers without counts
+        missing = {
+            name: cfg for name, cfg in self.store.items()
+            if self._tool_count_for(name, cfg) == 0
+        }
+        if missing:
+            thread = Thread(target=self._fetch_tool_counts, args=(missing,), daemon=True)
+            thread.start()
+
+    def _fetch_tool_counts(self, configs: dict[str, dict]):
+        new_counts = fetch_tool_counts_for_configs(configs)
+        if new_counts:
+            merged = {**self.cached_tool_counts, **new_counts}
+            save_tool_counts_cache(merged)
+            try:
+                self.call_from_thread(self._apply_fetched_counts, merged)
+            except Exception:
+                pass
+
+    def _apply_fetched_counts(self, counts: dict[str, int]):
+        self.cached_tool_counts = counts
+        for row in self.query(MCPRow):
+            tc = self._tool_count_for(row.mcp_name, row.mcp_cfg)
+            if tc != row.tool_count:
+                row.tool_count = tc
+                row.refresh()
 
     def _render_tab_bar(self, cwd_name: str | None = None) -> str:
         if cwd_name is None:
@@ -1032,68 +1056,23 @@ class ManCPApp(App):
     # -- Discover tab --
 
     def _show_categories(self):
-        """Show category list with popular servers at the top."""
+        """Show category list from awesome-mcp-servers."""
         self.discover_view = "categories"
         self.discover_cursor = 0
         container = self.query_one("#discover-results", ScrollableContainer)
         container.remove_children()
 
-        # Popular servers header + a few entries (loaded async)
-        container.mount(Label(
-            " [dim]── popular (by recent usage) ──[/dim]",
-            classes="readonly-header",
-        ))
         self.query_one("#discover-status", Static).update(
             "  [bold]Discover MCP servers[/bold]"
         )
 
-        # Load popular servers in background
-        thread = Thread(target=self._do_load_popular, daemon=True)
-        thread.start()
-
-        # Categories section
-        container.mount(Label(
-            " [dim]── categories ──[/dim]",
-            classes="readonly-header",
-        ))
         categories = fetch_categories()
         for idx, (cat_name, cat_count) in enumerate(categories):
             row = CategoryRow(name=cat_name, count=cat_count, index=idx)
             container.mount(row)
 
-        # Set initial cursor to first navigable row (CategoryRow until popular loads)
         self._set_discover_cursor(0)
         self.query_one("#footer-hints", Label).update(self._footer_for_tab())
-
-    def _do_load_popular(self):
-        servers = fetch_popular_servers()
-        self.call_from_thread(self._insert_popular_rows, servers)
-
-    def _insert_popular_rows(self, servers: list[DiscoverServer]):
-        self.discover_popular_all = servers
-        self.discover_popular_shown = min(8, len(servers))
-        container = self.query_one("#discover-results", ScrollableContainer)
-        # Find the "categories" header label to insert before it
-        labels = [w for w in container.children if isinstance(w, Label) and "categories" in str(w.render())]
-        insert_before = labels[0] if labels else None
-
-        for server in servers[:self.discover_popular_shown]:
-            row = DiscoverRow(server=server, index=-1, in_store=_discover_server_in_store(server, self.store))
-            if insert_before:
-                container.mount(row, before=insert_before)
-            else:
-                container.mount(row)
-
-        if len(servers) > self.discover_popular_shown:
-            more = MoreRow(label="more...", section="popular")
-            if insert_before:
-                container.mount(more, before=insert_before)
-            else:
-                container.mount(more)
-
-        # Reset cursor to first row (now a popular server)
-        if servers and self.discover_view == "categories":
-            self._set_discover_cursor(0)
 
     def _navigable_discover_rows(self) -> list[DiscoverRow | CategoryRow | MoreRow]:
         """All navigable rows in discover tab, in DOM order."""
@@ -1175,40 +1154,8 @@ class ManCPApp(App):
 
     def _load_more(self, section: str):
         """Load more results for a section."""
-        if section == "popular":
-            self._load_more_popular()
-        elif section == "category":
+        if section == "category":
             self._load_more_category()
-
-    def _load_more_popular(self):
-        """Show more popular servers from the cached full list."""
-        all_servers = self.discover_popular_all
-        currently_shown = self.discover_popular_shown
-        if currently_shown >= len(all_servers):
-            return
-        # Remove the existing "more..." row for popular
-        for w in self.query(MoreRow):
-            if w.section == "popular":
-                w.remove()
-                break
-        container = self.query_one("#discover-results", ScrollableContainer)
-        # Find the categories header to insert before it
-        labels = [w for w in container.children if isinstance(w, Label) and "categories" in str(w.render())]
-        insert_before = labels[0] if labels else None
-        next_batch = all_servers[currently_shown:currently_shown + 8]
-        for server in next_batch:
-            row = DiscoverRow(server=server, index=-1, in_store=_discover_server_in_store(server, self.store))
-            if insert_before:
-                container.mount(row, before=insert_before)
-            else:
-                container.mount(row)
-        self.discover_popular_shown = currently_shown + len(next_batch)
-        if self.discover_popular_shown < len(all_servers):
-            more = MoreRow(label="more...", section="popular")
-            if insert_before:
-                container.mount(more, before=insert_before)
-            else:
-                container.mount(more)
 
     def _load_more_category(self):
         """Load next page of category servers from GitHub."""
@@ -1274,15 +1221,8 @@ class ManCPApp(App):
     def _add_discover_server(self, server: DiscoverServer):
         # Derive short name and package from the GitHub URL
         # URL format: https://github.com/owner/repo
-        short = server.name
+        short = normalize_server_name(server.name)
         author = server.author
-
-        for pfx in ("mcp-server-", "mcp-"):
-            if short.startswith(pfx):
-                short = short[len(pfx):]
-        for sfx in ("-mcp-server", "-mcp"):
-            if short.endswith(sfx):
-                short = short[:-len(sfx)]
 
         if short in self.store:
             self.query_one("#status-bar", Static).update(f"  '{short}' already in store")
@@ -1844,15 +1784,11 @@ class ManCPApp(App):
 
     def _tool_count_for(self, name: str, cfg: dict | None = None) -> int:
         if cfg is not None:
-            return estimate_tool_count(name, cfg, self.tool_counts)
-        if name in KNOWN_TOOL_COUNTS:
-            return KNOWN_TOOL_COUNTS[name]
-        if name in self.tool_counts:
-            return self.tool_counts[name]
-        alt = name.replace("-", "_")
-        if alt in self.tool_counts:
-            return self.tool_counts[alt]
-        return 0
+            return estimate_tool_count(name, cfg, self.tool_counts, self.cached_tool_counts)
+        # For readonly rows, check cache then permission counts
+        if name in self.cached_tool_counts:
+            return self.cached_tool_counts[name]
+        return tool_count_for(name, self.tool_counts)
 
     def _plugin_widgets(self):
         if not self.plugin_ids:

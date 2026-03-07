@@ -16,7 +16,7 @@ from mancp.store import (
     save_store,
     set_plugin_enabled,
 )
-from mancp.registry import is_in_store, search_all
+from mancp.registry import is_in_store, normalize_server_name, search_all
 
 
 def cmd_init() -> None:
@@ -169,8 +169,8 @@ def cmd_add(args) -> None:
                 if name.startswith(prefix):
                     name = name[len(prefix):]
                     break
-            if name.startswith("mcp-server-"):
-                name = name[len("mcp-server-"):]
+            else:
+                name = normalize_server_name(name)
         cfg = {"command": "npx", "args": ["-y", pkg]}
         print(f"Adding '{name}' (npx -y {pkg})")
 

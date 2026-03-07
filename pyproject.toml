@@ -1,0 +1,44 @@
+[project]
+name = "mancp"
+version = "0.1.0"
+description = "MCP profile manager for Claude Code — pick which MCP servers load per project"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Dumky de Wilde" }]
+keywords = ["mcp", "claude", "claude-code", "conductor", "tui"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "textual>=1.0.0",
+]
+
+[project.scripts]
+mancp = "mancp.cli:main"
+
+[project.urls]
+Repository = "https://github.com/dumkydewilde/mancp"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mancp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

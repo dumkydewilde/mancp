@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "scrapers_db": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@bytebase/dbhub",
+        "--dsn",
+        "postgresql://claude_code_confcrawler:81TWhsb4MeuLcCKyfbfqL5Wo5rcOLMztyF9rJVvaNdJPBtj0uAfmiXht7UwAnZsZ@100.86.240.51:1232/scrapers"
+      ],
+      "env": {}
+    }
+  }
+}

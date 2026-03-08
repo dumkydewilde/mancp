@@ -1,6 +1,6 @@
 [project]
 name = "mancp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP profile manager for Claude Code — pick which MCP servers load per project"
 readme = "README.md"
 license = "MIT"

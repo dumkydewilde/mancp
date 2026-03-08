@@ -245,6 +245,147 @@ def inspect_mcp_tool_count(cfg: dict) -> int | None:
     return None
 
 
+def inspect_mcp_tools(cfg: dict) -> list[dict] | None:
+    """Inspect an MCP server to get full tool definitions.
+
+    Returns list of tool dicts with 'name' and 'description', or None on failure.
+    """
+    url = cfg.get("url", "")
+    command = cfg.get("command", "")
+    args = cfg.get("args", [])
+    env = cfg.get("env", None)
+
+    if url:
+        tools_list = _mcp_inspect_http_tools(url, env)
+    elif command:
+        tools_list = _mcp_inspect_stdio_tools(command, args, env)
+    else:
+        return None
+    return tools_list
+
+
+def _mcp_inspect_stdio_tools(command: str, args: list, env: dict | None = None, timeout: int = 15) -> list[dict] | None:
+    """Start a stdio MCP server, call tools/list, return tool definitions."""
+    full_env = {**os.environ, **(env or {})}
+
+    try:
+        proc = subprocess.Popen(
+            [command, *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=full_env,
+        )
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+    def _send(msg: dict) -> None:
+        line = json.dumps(msg) + "\n"
+        proc.stdin.write(line.encode())
+        proc.stdin.flush()
+
+    def _recv() -> dict | None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                return None
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                if "id" in msg:
+                    return msg
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    try:
+        _send({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "mancp", "version": "0.1.0"},
+            },
+        })
+        init_resp = _recv()
+        if not init_resp or "error" in init_resp:
+            return None
+
+        _send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        _send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        tools_resp = _recv()
+        if not tools_resp or "error" in tools_resp:
+            return None
+
+        tools = tools_resp.get("result", {}).get("tools", [])
+        return [
+            {"name": t.get("name", ""), "description": t.get("description", "")}
+            for t in tools
+        ]
+    except (OSError, BrokenPipeError):
+        return None
+    finally:
+        try:
+            proc.stdin.close()
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+
+
+def _mcp_inspect_http_tools(url: str, env: dict | None = None, timeout: int = 10) -> list[dict] | None:
+    """Connect to a streamable-http MCP server and return tool definitions."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "User-Agent": "mancp",
+    }
+    if env:
+        for key, val in env.items():
+            k = key.upper()
+            if "TOKEN" in k or "KEY" in k or "SECRET" in k or "AUTH" in k:
+                headers.setdefault("Authorization", f"Bearer {val}")
+                break
+
+    def _post(msg: dict) -> dict | None:
+        data = json.dumps(msg).encode()
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                for line in body.splitlines():
+                    if line.startswith("data: "):
+                        return json.loads(line[6:])
+                return json.loads(body)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            return None
+
+    init_resp = _post({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "mancp", "version": "0.1.0"},
+        },
+    })
+    if not init_resp or "error" in init_resp:
+        return None
+
+    tools_resp = _post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    if not tools_resp or "error" in tools_resp:
+        return None
+
+    tools = tools_resp.get("result", {}).get("tools", [])
+    return [
+        {"name": t.get("name", ""), "description": t.get("description", "")}
+        for t in tools
+    ]
+
+
 def fetch_tool_counts_for_configs(configs: dict[str, dict]) -> dict[str, int]:
     """Inspect MCP servers to get actual tool counts via the MCP protocol.
 
@@ -869,41 +1010,219 @@ def _extract_skill_frontmatter_description(text: str) -> str:
     return ""
 
 
-def search_skills(query: str) -> list[Skill]:
-    """Search skills by filtering the all-time list by query."""
+def search_skills_sh(query: str) -> list[Skill]:
+    """Search skills via the skills.sh REST API."""
+    cache_name = f"skills_sh_search_{urllib.parse.quote(query, safe='')}"
+    if _cache_is_fresh(cache_name):
+        cached = _cache_read(cache_name)
+        if cached and isinstance(cached, list):
+            return [Skill(**s) for s in cached]
+
+    url = f"https://skills.sh/api/search?q={urllib.parse.quote(query)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "mancp"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return []
+
+    skills: list[Skill] = []
+    for entry in data.get("skills", []):
+        skills.append(Skill(
+            name=entry.get("name", entry.get("skillId", "")),
+            source=entry.get("source", ""),
+            installs=entry.get("installs", 0),
+        ))
+
+    _cache_write(cache_name, [
+        {"name": s.name, "source": s.source, "installs": s.installs}
+        for s in skills
+    ])
+    return skills
+
+
+def search_skills(query: str, cwd: Path | None = None) -> list[Skill]:
+    """Search skills: installed + skills.sh API + alltime fallback."""
     query_lower = query.lower()
+
+    # 1. Search installed skills
+    installed = get_installed_skills(cwd=cwd)
+    installed_matches = [
+        Skill(name=s["name"], source="local")
+        for s in installed
+        if query_lower in s["name"].lower()
+        or query_lower in s.get("description", "").lower()
+    ]
+
+    # 2. Search skills.sh API
+    api_results = search_skills_sh(query)
+
+    # 3. Fallback: filter alltime list
     alltime = fetch_skills_alltime()
-    return [s for s in alltime if query_lower in s.name.lower() or query_lower in s.source.lower()]
+    alltime_matches = [
+        s for s in alltime
+        if query_lower in s.name.lower() or query_lower in s.source.lower()
+    ]
+
+    # Merge: installed first, then API, then alltime, deduplicated
+    seen: set[str] = set()
+    merged: list[Skill] = []
+    for s in installed_matches + api_results + alltime_matches:
+        key = s.name
+        if key not in seen:
+            seen.add(key)
+            merged.append(s)
+    return merged
 
 
-def get_installed_skills() -> list[dict]:
-    """Get locally installed skills from ~/.claude/skills/.
+def _scan_skills_dir(skills_dir: Path, scope: str, disabled_names: set[str]) -> list[dict]:
+    """Scan a skills directory and return skill dicts.
 
-    Returns list of dicts with 'name', 'description', 'path'.
+    scope is "global" or "project".
     """
-    skills_dir = Path.home() / ".claude" / "skills"
     if not skills_dir.exists():
         return []
 
     installed: list[dict] = []
     for entry in sorted(skills_dir.iterdir()):
-        skill_md = entry / "SKILL.md" if entry.is_dir() else None
-        # Handle symlinks
+        if entry.name.startswith("."):
+            continue
+
+        # Resolve target for symlinks
         if entry.is_symlink():
             target = entry.resolve()
-            skill_md = target / "SKILL.md" if target.is_dir() else None
-        if skill_md and skill_md.exists():
-            desc = ""
-            try:
-                text = skill_md.read_text()
-                desc = _extract_skill_frontmatter_description(text)
-            except OSError:
-                pass
-            installed.append({
-                "name": entry.name,
-                "description": desc,
-                "path": str(entry),
-            })
+        else:
+            target = entry
+
+        if not target.is_dir():
+            continue
+
+        # Check for SKILL.md or SKILL.md.disabled
+        skill_md = target / "SKILL.md"
+        skill_md_disabled = target / "SKILL.md.disabled"
+        is_disabled = entry.name in disabled_names
+
+        active_md = None
+        if skill_md.exists():
+            active_md = skill_md
+        elif skill_md_disabled.exists():
+            active_md = skill_md_disabled
+            is_disabled = True
+
+        if not active_md:
+            continue
+
+        desc = ""
+        md_size = 0
+        try:
+            text = active_md.read_text()
+            desc = _extract_skill_frontmatter_description(text)
+            md_size = len(text)
+        except OSError:
+            pass
+
+        # Determine source repo from symlink target
+        source_repo = ""
+        if entry.is_symlink():
+            source_repo = _get_skill_source(entry.name)
+
+        installed.append({
+            "name": entry.name,
+            "description": desc,
+            "path": str(entry),
+            "disabled": is_disabled,
+            "skill_md_size": md_size,
+            "source_repo": source_repo,
+            "scope": scope,
+        })
     return installed
+
+
+def get_installed_skills(cwd: Path | None = None) -> list[dict]:
+    """Get installed skills from both global and project scopes.
+
+    Global: ~/.claude/skills/
+    Project: <cwd>/.claude/skills/ (if it exists)
+
+    Returns list of dicts with 'name', 'description', 'path', 'disabled',
+    'skill_md_size', 'source_repo', 'in_user' (bool), 'in_project' (bool).
+    Each skill name appears once with flags for which scopes it's installed in.
+    Project info takes precedence for description/disabled when in both scopes.
+    """
+    from .store import load_disabled_skills
+    disabled_names = load_disabled_skills()
+
+    global_dir = Path.home() / ".claude" / "skills"
+    global_skills = _scan_skills_dir(global_dir, "global", disabled_names)
+
+    project_skills: list[dict] = []
+    if cwd:
+        project_dir = cwd / ".claude" / "skills"
+        if project_dir.exists() and project_dir != global_dir:
+            project_skills = _scan_skills_dir(project_dir, "project", disabled_names)
+
+    # Build merged view with in_user/in_project flags
+    by_name: dict[str, dict] = {}
+    for s in global_skills:
+        by_name[s["name"]] = {**s, "in_user": True, "in_project": False}
+    for s in project_skills:
+        if s["name"] in by_name:
+            # In both scopes — project info takes precedence for display
+            by_name[s["name"]]["in_project"] = True
+            by_name[s["name"]]["disabled"] = s["disabled"]
+            if s["description"]:
+                by_name[s["name"]]["description"] = s["description"]
+            if s["skill_md_size"] > by_name[s["name"]].get("skill_md_size", 0):
+                by_name[s["name"]]["skill_md_size"] = s["skill_md_size"]
+        else:
+            by_name[s["name"]] = {**s, "in_user": False, "in_project": True}
+
+    return list(by_name.values())
+
+
+def _get_skill_source(name: str) -> str:
+    """Get the source repo for an installed skill from the lock file.
+
+    Checks both global (~/.agents/.skill-lock.json) and project-level
+    (.agents/.skill-lock.json) lock files.
+    """
+    for lock_file in [
+        Path.home() / ".agents" / ".skill-lock.json",
+        Path(".agents") / ".skill-lock.json",
+    ]:
+        if not lock_file.exists():
+            continue
+        try:
+            data = json.loads(lock_file.read_text())
+            skill_data = data.get("skills", {}).get(name, {})
+            source = skill_data.get("source", "")
+            if source:
+                return source
+        except (json.JSONDecodeError, OSError):
+            continue
+    return ""
+
+
+def estimate_skills_menu_tokens(installed: list[dict] | None = None, cwd: Path | None = None) -> int:
+    """Estimate total tokens for the skills 'menu' (trigger descriptions).
+
+    This is the cost always present in every conversation's system prompt.
+    """
+    from .store import CHARS_PER_TOKEN
+    if installed is None:
+        installed = get_installed_skills(cwd=cwd)
+    # Each skill contributes: "- name: description\n" to the menu
+    total_chars = 0
+    for s in installed:
+        if not s.get("disabled", False):
+            line = f"- {s['name']}: {s.get('description', '')}\n"
+            total_chars += len(line)
+    return max(0, total_chars // CHARS_PER_TOKEN)
+
+
+def estimate_skill_tokens(skill_md_size: int) -> int:
+    """Estimate tokens for a full SKILL.md when activated."""
+    from .store import CHARS_PER_TOKEN
+    return max(0, skill_md_size // CHARS_PER_TOKEN)
 
 

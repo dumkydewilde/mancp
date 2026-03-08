@@ -1760,7 +1760,7 @@ class ManCPApp(App):
             return (
                 "  [dim]j/k[/dim] navigate   [dim]u[/dim] user   [dim]p[/dim] project   "
                 "[dim]e[/dim] enable   [dim]enter[/dim] detail   [dim]d[/dim] remove   "
-                "[dim]s[/dim] save   [dim]←[/dim] servers   [dim]→[/dim] search   [dim]q[/dim] quit"
+                "[dim]←[/dim] servers   [dim]→[/dim] search   [dim]q[/dim] quit"
             )
         if self.active_tab == "search":
             return (
@@ -2738,42 +2738,12 @@ class ManCPApp(App):
                 self._set_skills_cursor(max(0, self.skills_cursor - 1))
             elif event.key == "enter":
                 self._skills_enter()
-            elif event.key == "u":
-                rows = self._navigable_skill_rows()
-                current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
-                if isinstance(current, SkillRow):
-                    if current.in_user or current.in_project:
-                        # Toggle user scope for installed skill
-                        if not current.in_user:
-                            self._install_skill(current.skill_name, current.source, scope="global")
-                        else:
-                            # Removing from user scope - only if also in project
-                            if current.in_project:
-                                self._remove_skill_scope(current, "global")
-                            else:
-                                self._notify(
-                                    "  [dim]Can't remove from user scope — it's the only scope[/dim]"
-                                )
-            elif event.key == "p":
-                rows = self._navigable_skill_rows()
-                current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
-                if isinstance(current, SkillRow):
-                    if current.in_user or current.in_project:
-                        if not current.in_project:
-                            self._install_skill(current.skill_name, current.source, scope="project")
-                        else:
-                            if current.in_user:
-                                self._remove_skill_scope(current, "project")
-                            else:
-                                self._notify(
-                                    "  [dim]Can't remove from project scope — it's the only scope[/dim]"
-                                )
             elif event.key == "d":
                 rows = self._navigable_skill_rows()
                 current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
                 if isinstance(current, SkillRow):
                     self._remove_skill(current)
-            elif event.key in ("e", "space"):
+            elif event.key == "space":
                 rows = self._navigable_skill_rows()
                 current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
                 if isinstance(current, SkillRow):
@@ -2906,27 +2876,57 @@ class ManCPApp(App):
         return None
 
     def action_toggle_user(self):
-        if self.active_tab != "servers":
-            return
-        row = self._current_row()
-        if isinstance(row, MCPRow):
-            row.toggle_user()
-        elif isinstance(row, PluginRow):
-            row.toggle_enabled()
+        if self.active_tab == "servers":
+            row = self._current_row()
+            if isinstance(row, MCPRow):
+                row.toggle_user()
+            elif isinstance(row, PluginRow):
+                row.toggle_enabled()
+        elif self.active_tab == "skills":
+            rows = self._navigable_skill_rows()
+            current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
+            if isinstance(current, SkillRow):
+                if current.in_user or current.in_project:
+                    if not current.in_user:
+                        self._install_skill(current.skill_name, current.source, scope="global")
+                    else:
+                        if current.in_project:
+                            self._remove_skill_scope(current, "global")
+                        else:
+                            self._notify(
+                                "  [dim]Can't remove from user scope — it's the only scope[/dim]"
+                            )
 
     def action_toggle_project(self):
-        if self.active_tab != "servers":
-            return
-        row = self._current_row()
-        if isinstance(row, MCPRow):
-            row.toggle_project()
+        if self.active_tab == "servers":
+            row = self._current_row()
+            if isinstance(row, MCPRow):
+                row.toggle_project()
+        elif self.active_tab == "skills":
+            rows = self._navigable_skill_rows()
+            current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
+            if isinstance(current, SkillRow):
+                if current.in_user or current.in_project:
+                    if not current.in_project:
+                        self._install_skill(current.skill_name, current.source, scope="project")
+                    else:
+                        if current.in_user:
+                            self._remove_skill_scope(current, "project")
+                        else:
+                            self._notify(
+                                "  [dim]Can't remove from project scope — it's the only scope[/dim]"
+                            )
 
     def action_toggle_enabled(self):
-        if self.active_tab != "servers":
-            return
-        row = self._current_row()
-        if isinstance(row, PluginRow):
-            row.toggle_enabled()
+        if self.active_tab == "servers":
+            row = self._current_row()
+            if isinstance(row, PluginRow):
+                row.toggle_enabled()
+        elif self.active_tab == "skills":
+            rows = self._navigable_skill_rows()
+            current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
+            if isinstance(current, SkillRow):
+                self._toggle_skill_enabled(current)
 
     def action_select_or_detail(self):
         if self.active_tab == "servers":

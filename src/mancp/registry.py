@@ -998,15 +998,33 @@ def _extract_skill_frontmatter_description(text: str) -> str:
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return ""
-    for line in lines[1:]:
+    i = 1
+    while i < len(lines):
+        line = lines[i]
         if line.strip() == "---":
             break
         if line.startswith("description:"):
-            # Handle both `description: text` and `description: "text"`
             val = line.split(":", 1)[1].strip()
+            # Handle YAML block scalars: | or > (with optional modifiers like |2, >-)
+            if val and val[0] in ("|", ">"):
+                # Collect indented continuation lines
+                block_lines = []
+                i += 1
+                while i < len(lines):
+                    next_line = lines[i]
+                    if next_line.strip() == "---":
+                        break
+                    # Block continues as long as line is indented or blank
+                    if next_line and not next_line[0].isspace():
+                        break
+                    block_lines.append(next_line.strip())
+                    i += 1
+                return " ".join(l for l in block_lines if l)
+            # Handle quoted values: description: "text" or description: 'text'
             if val and val[0] in ('"', "'") and val[-1] == val[0]:
                 val = val[1:-1]
             return val
+        i += 1
     return ""
 
 

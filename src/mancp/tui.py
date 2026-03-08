@@ -1,6 +1,8 @@
 """Textual TUI for mancp."""
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from threading import Thread
 
@@ -33,11 +35,16 @@ from mancp.store import (
     categorize_readonly,
     collect_readonly_mcps,
     count_mcp_tools,
+    get_connector_auth_url,
+    get_desktop_extensions,
+    get_desktop_mcps,
+    get_mcp_tool_names,
     estimate_mcp_tokens,
     estimate_tool_count,
     get_plugins,
     get_project_scope_mcps,
     get_user_scope_mcps,
+    load_plugin_metadata,
     load_settings,
     load_tool_counts_cache,
     mask_secrets,
@@ -55,6 +62,15 @@ from mancp.store import (
 
 NAME_WIDTH = 26
 BADGE_WIDTH = 4  # right-aligned token badge column
+
+
+def _clean_skills_output(raw: str) -> str:
+    """Strip ANSI codes and ASCII art banner from npx skills CLI output."""
+    import re
+    clean = re.sub(r'\x1b\[[0-9;]*m', '', raw.strip())
+    lines = [l.strip() for l in clean.splitlines()
+             if l.strip() and not any(c in l for c in "═║╔╗╚╝█▀▄")]
+    return lines[-1] if lines else clean[:80]
 
 
 def _discover_server_in_store(server: DiscoverServer, store: dict) -> bool:
@@ -83,6 +99,26 @@ def _format_token_badge(tool_count: int) -> str:
     if level == "medium":
         return f"[#d97706]{padded}[/]"
     return f"[#6b7280]{padded}[/]"
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Copy text to system clipboard. Returns True on success."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        elif sys.platform == "linux":
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text.encode(),
+                check=True,
+            )
+        elif sys.platform == "win32":
+            subprocess.run(["clip"], input=text.encode(), check=True)
+        else:
+            return False
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
 
 
 class MCPRow(Widget):
@@ -141,25 +177,35 @@ class ReadOnlyRow(Widget):
 
     can_focus = False
 
-    def __init__(self, name: str, status: str, tool_count: int = 0):
+    focused: reactive[bool] = reactive(False)
+
+    def __init__(self, name: str, status: str, tool_count: int = 0, mcp_cfg: dict | None = None):
         super().__init__()
         self.mcp_name = name
         self.status = status
         self.tool_count = tool_count
+        self.mcp_cfg = mcp_cfg or {}
 
     def render(self) -> str:
+        cursor = "[bold]>[/] " if self.focused else "  "
         if self.status == "connected":
             indicator = "[#10b981]✓[/]"
         elif self.status == "needs auth":
             indicator = "[#d97706]⚠[/]"
+        elif self.status.startswith("desktop"):
+            indicator = "[#6FC2FF]◇[/]"
         elif "disabled" in self.status:
             indicator = "[#6b7280]·[/]"
         else:
             indicator = "[#6b7280]·[/]"
 
         badge = _format_token_badge(self.tool_count)
-        padded_name = f"[#6b7280]{self.mcp_name.ljust(NAME_WIDTH)}[/]"
-        return f"  {indicator}     {padded_name} {badge}  [dim]{self.status}[/dim]"
+        padded_name = self.mcp_name.ljust(NAME_WIDTH)
+        if self.focused:
+            padded_name = f"[bold]{padded_name}[/bold]"
+        else:
+            padded_name = f"[#6b7280]{padded_name}[/]"
+        return f"{cursor}{indicator}     {padded_name} {badge}  [dim]{self.status}[/dim]"
 
 
 class PluginRow(Widget):
@@ -314,7 +360,72 @@ class MoreRow(Widget):
 
 
 class SkillRow(Widget):
-    """A single row in the skills tab."""
+    """Single row for an installed skill: name + independent U and P toggles."""
+
+    can_focus = False
+
+    focused: reactive[bool] = reactive(False)
+    in_user: reactive[bool] = reactive(False)
+    in_project: reactive[bool] = reactive(False)
+    disabled: reactive[bool] = reactive(False)
+
+    def __init__(
+        self,
+        skill_name: str,
+        source: str,
+        in_user: bool = False,
+        in_project: bool = False,
+        disabled: bool = False,
+        description: str = "",
+        token_estimate: int = 0,
+    ):
+        super().__init__()
+        self.skill_name = skill_name
+        self.source = source
+        self.in_user = in_user
+        self.in_project = in_project
+        self.disabled = disabled
+        self.description = description
+        self.token_estimate = token_estimate
+
+    def render(self) -> str:
+        cursor = "[bold]>[/] " if self.focused else "  "
+        u = "[#10b981]✓[/]" if self.in_user else "[#6b7280]✗[/]"
+        p = "[#10b981]✓[/]" if self.in_project else "[#6b7280]✗[/]"
+
+        if self.token_estimate > 0:
+            tk = f"{self.token_estimate // 1000}k" if self.token_estimate >= 1000 else str(self.token_estimate)
+            padded = tk.rjust(BADGE_WIDTH)
+            level = token_warning_level(self.token_estimate)
+            if level == "high":
+                badge = f"[#ef4444]{padded}[/]"
+            elif level == "medium":
+                badge = f"[#d97706]{padded}[/]"
+            else:
+                badge = f"[#6b7280]{padded}[/]"
+        else:
+            badge = f"[#6b7280]{'·':>{BADGE_WIDTH}}[/]"
+
+        padded_name = self.skill_name[:NAME_WIDTH].ljust(NAME_WIDTH)
+        if self.disabled:
+            padded_name = f"[#4b5563]○ {padded_name}[/]"
+        elif self.focused:
+            padded_name = f"[bold]{padded_name}[/bold]"
+        else:
+            padded_name = f"[#6b7280]{padded_name}[/]"
+
+        meta = self.description if self.description else self.source
+        return f"{cursor}{u}  {p}  {padded_name} {badge}  [dim]{meta[:46]}[/dim]"
+
+    def toggle_user(self):
+        self.in_user = not self.in_user
+
+    def toggle_project(self):
+        self.in_project = not self.in_project
+
+
+class SkillSearchRow(Widget):
+    """A search/discover result row for skills (not yet installed)."""
 
     can_focus = False
 
@@ -331,6 +442,7 @@ class SkillRow(Widget):
     def render(self) -> str:
         cursor = "[bold]>[/] " if self.focused else "  "
         indicator = "[#10b981]✓[/]" if self.installed else "[#6b7280]·[/]"
+
         padded_name = self.skill_name[:NAME_WIDTH].ljust(NAME_WIDTH)
         if self.focused:
             padded_name = f"[bold]{padded_name}[/bold]"
@@ -342,64 +454,77 @@ class SkillRow(Widget):
                 inst = f"{self.installs / 1000:.1f}K"
             else:
                 inst = str(self.installs)
-            inst_col = f"[dim]{inst:>6}[/]"
+            badge_col = f"[dim]{inst:>6}[/]"
         else:
-            inst_col = f"{'':>6}"
+            badge_col = f"{'':>6}"
 
         meta = self.description if self.description else self.source
-        return f"{cursor}{indicator}  {padded_name} {inst_col}  [dim]{meta[:60]}[/dim]"
+        return f"{cursor}{indicator}  {padded_name} {badge_col}  [dim]{meta[:46]}[/dim]"
 
 
 class SkillDetailScreen(ModalScreen):
-    """Detail view for a skill."""
+    """Detail view for an installed skill."""
 
     BINDINGS = [
         Binding("escape,q", "close", "Close"),
-        Binding("a", "add", "Add skill"),
-        Binding("d", "delete", "Remove skill"),
-        Binding("o", "open_link", "Open in browser"),
     ]
 
-    def __init__(self, skill_name: str, source: str, installs: int = 0, installed: bool = False, description: str = ""):
+    def __init__(self, skill_name: str, source: str, in_user: bool = False, in_project: bool = False, disabled: bool = False, description: str = "", token_estimate: int = 0):
         super().__init__()
         self.skill_name = skill_name
         self.source = source
-        self.installs = installs
-        self.is_installed = installed
+        self.in_user = in_user
+        self.in_project = in_project
+        self.skill_disabled = disabled
         self.description = description
+        self.token_estimate = token_estimate
+
+    @property
+    def github_url(self) -> str:
+        return f"https://github.com/{self.source}" if "/" in self.source and self.source != "local" else ""
 
     def compose(self) -> ComposeResult:
-        github_url = f"https://github.com/{self.source}" if "/" in self.source else ""
-        lines = [
-            f"[bold]{self.skill_name}[/bold]",
-            "",
-            f"  [dim]Source:[/dim]    {self.source}",
-        ]
-        if github_url:
-            lines.append(f"  [dim]GitHub:[/dim]    {github_url}")
-        if self.installs:
-            lines.append(f"  [dim]Installs:[/dim]  {self.installs:,}")
+        lines = [f"[bold]{self.skill_name}[/bold]"]
+
+        meta_parts = []
+        if self.source and self.source != "local":
+            meta_parts.append(self.source)
+        scopes = []
+        if self.in_user:
+            scopes.append("user")
+        if self.in_project:
+            scopes.append("project")
+        if scopes:
+            meta_parts.append(f"{' + '.join(scopes)} scope")
+        if meta_parts:
+            lines.append(f"[dim]{' · '.join(meta_parts)}[/dim]")
+
+        state = "[#d97706]disabled[/]" if self.skill_disabled else "[#10b981]enabled[/]"
+        if self.token_estimate > 0:
+            tk = f"~{self.token_estimate:,}"
+            lines.append(f"{state} [dim]· {tk} tokens when activated[/dim]")
+        else:
+            lines.append(state)
+
         if self.description:
-            lines += ["", f"  {self.description}"]
-        if not self.is_installed and "/" in self.source:
-            lines += [
-                "",
-                f"  [dim]Install:[/dim]   npx skills add --global {self.source}",
-            ]
+            lines += ["", self.description]
+
         lines += [
             "",
-            "[dim]──────────────────────────────────────────────[/dim]",
+            f"[dim]{'─' * 46}[/dim]",
         ]
-        if self.is_installed:
-            lines.append("  [#10b981]Installed[/]  —  [bold]D[/bold]  remove  —  [bold]O[/bold]  open in browser")
-        else:
-            lines.append("  [bold]A[/bold]  install  —  [bold]O[/bold]  open in browser")
-        lines.append("  [bold]Q / Esc[/bold]  close")
+        toggle_label = "enable" if self.skill_disabled else "disable"
+        actions = f"[bold]E[/bold] {toggle_label} · [bold]D[/bold] remove"
+        if self.github_url:
+            actions += " · [bold]o[/bold] open in browser"
+        actions += " · [bold]c[/bold] copy"
+        lines.append(actions)
+        lines.append("[bold]Q / Esc[/bold] close")
 
         with ScrollableContainer(id="skill-detail-box"):
             yield Label("\n".join(lines), id="skill-detail-content")
             if not self.description:
-                yield Static("  [dim]Loading description...[/dim]", id="skill-readme")
+                yield Static("[dim]Loading description...[/dim]", id="skill-readme")
 
     def on_mount(self):
         if not self.description and "/" in self.source:
@@ -411,7 +536,7 @@ class SkillDetailScreen(ModalScreen):
         try:
             self.app.call_from_thread(self._show_description, desc)
         except Exception:
-            pass  # Screen was dismissed before thread finished
+            pass
 
     def _show_description(self, desc: str):
         try:
@@ -419,25 +544,41 @@ class SkillDetailScreen(ModalScreen):
         except Exception:
             return
         if desc:
-            widget.update(f"\n  {desc}")
+            widget.update(f"\n{desc}")
         else:
             widget.update("")
 
     def action_close(self):
         self.dismiss(None)
 
-    def action_add(self):
-        if not self.is_installed:
-            self.dismiss("add")
-
     def action_delete(self):
-        if self.is_installed:
-            self.dismiss("delete")
+        self.dismiss("delete")
+
+    def action_toggle_enabled(self):
+        self.dismiss("toggle_enabled")
 
     def action_open_link(self):
-        if "/" in self.source:
-            import webbrowser
-            webbrowser.open(f"https://github.com/{self.source}")
+        if self.github_url:
+            subprocess.Popen(["open", self.github_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def key_o(self):
+        self.action_open_link()
+
+    def key_d(self):
+        self.action_delete()
+
+    def key_e(self):
+        self.action_toggle_enabled()
+
+    def key_c(self):
+        """Copy skill install command to clipboard."""
+        text = f"claude skill install {self.source}"
+        if _copy_to_clipboard(text):
+            try:
+                widget = self.query_one("#skill-detail-content", Label)
+                widget.update(widget.renderable + "\n[#10b981]Copied to clipboard![/]")
+            except Exception:
+                pass
 
     DEFAULT_CSS = """
     SkillDetailScreen {
@@ -456,6 +597,255 @@ class SkillDetailScreen(ModalScreen):
     #skill-readme {
         width: 100%;
         height: auto;
+    }
+    """
+
+
+class SkillSearchDetailScreen(ModalScreen):
+    """Detail view for a skill search result with option to install."""
+
+    BINDINGS = [
+        Binding("escape,q", "close", "Close"),
+    ]
+
+    def __init__(self, skill_name: str, source: str, installs: int = 0, installed: bool = False, description: str = ""):
+        super().__init__()
+        self.skill_name = skill_name
+        self.source = source
+        self.installs = installs
+        self.is_installed = installed
+        self.description = description
+
+    @property
+    def github_url(self) -> str:
+        return f"https://github.com/{self.source}" if "/" in self.source and self.source != "local" else ""
+
+    def compose(self) -> ComposeResult:
+        lines = [f"[bold]{self.skill_name}[/bold]"]
+
+        meta_parts = []
+        if self.source and self.source != "local":
+            meta_parts.append(self.source)
+        if self.installs:
+            meta_parts.append(f"{self.installs:,} installs")
+        if meta_parts:
+            lines.append(f"[dim]{' · '.join(meta_parts)}[/dim]")
+
+        if self.is_installed:
+            lines.append("[#10b981]already installed[/]")
+
+        if self.description:
+            lines += ["", self.description]
+
+        lines += [
+            "",
+            f"[dim]{'─' * 46}[/dim]",
+        ]
+        if not self.is_installed:
+            actions = "[bold]U[/bold] install user · [bold]P[/bold] install project"
+        else:
+            actions = "[dim]already installed[/dim]"
+        if self.github_url:
+            actions += " · [bold]o[/bold] open in browser"
+        actions += " · [bold]c[/bold] copy"
+        lines.append(actions)
+        lines.append("[bold]Q / Esc[/bold] close")
+
+        with ScrollableContainer(id="skill-search-detail-box"):
+            yield Label("\n".join(lines), id="skill-search-detail-content")
+            if not self.description:
+                yield Static("[dim]Loading description...[/dim]", id="skill-search-readme")
+
+    def on_mount(self):
+        if not self.description and "/" in self.source:
+            thread = Thread(target=self._fetch_description, daemon=True)
+            thread.start()
+
+    def _fetch_description(self):
+        desc = fetch_skill_description(self.source, self.skill_name)
+        try:
+            self.app.call_from_thread(self._show_description, desc)
+        except Exception:
+            pass
+
+    def _show_description(self, desc: str):
+        try:
+            widget = self.query_one("#skill-search-readme", Static)
+        except Exception:
+            return
+        if desc:
+            widget.update(f"\n{desc}")
+        else:
+            widget.update("")
+
+    def action_close(self):
+        self.dismiss(None)
+
+    def key_u(self):
+        if not self.is_installed:
+            self.dismiss("add_user")
+
+    def key_p(self):
+        if not self.is_installed:
+            self.dismiss("add_project")
+
+    def key_o(self):
+        if self.github_url:
+            subprocess.Popen(["open", self.github_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def key_c(self):
+        text = f"claude skill install {self.source}"
+        if _copy_to_clipboard(text):
+            try:
+                widget = self.query_one("#skill-search-detail-content", Label)
+                widget.update(widget.renderable + "\n[#10b981]Copied to clipboard![/]")
+            except Exception:
+                pass
+
+    DEFAULT_CSS = """
+    SkillSearchDetailScreen {
+        align: center middle;
+    }
+    #skill-search-detail-box {
+        width: 72;
+        max-height: 85%;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #skill-search-detail-content {
+        width: 100%;
+        height: auto;
+    }
+    #skill-search-readme {
+        width: 100%;
+        height: auto;
+    }
+    """
+
+
+class SkillsDiscoverScreen(ModalScreen):
+    """Full-screen modal for browsing discoverable skills."""
+
+    BINDINGS = [
+        Binding("escape,q", "close", "Close"),
+    ]
+
+    def __init__(self, installed_names: set[str]):
+        super().__init__()
+        self.installed_names = installed_names
+        self._skills: list[Skill] = []
+        self._cursor = 0
+
+    def compose(self) -> ComposeResult:
+        with ScrollableContainer(id="skills-discover-box"):
+            yield Static("[dim]Loading skills from skills.sh...[/dim]", id="skills-discover-status")
+            yield ScrollableContainer(id="skills-discover-list")
+
+    def on_mount(self):
+        thread = Thread(target=self._fetch_skills, daemon=True)
+        thread.start()
+
+    def _fetch_skills(self):
+        skills = fetch_skills_discover(count=75)
+        self.app.call_from_thread(self._show_skills, skills)
+
+    def _show_skills(self, skills: list[Skill]):
+        self._skills = [s for s in skills if s.name not in self.installed_names]
+        container = self.query_one("#skills-discover-list", ScrollableContainer)
+        container.remove_children()
+        for s in self._skills:
+            row = SkillSearchRow(
+                skill_name=s.name,
+                source=s.source,
+                installs=s.installs,
+                installed=s.name in self.installed_names,
+            )
+            container.mount(row)
+        self.query_one("#skills-discover-status", Static).update(
+            f"[bold]{len(self._skills)} skills[/bold] [dim]· Enter to view · U user install · P project install · Q to close[/dim]"
+        )
+        self._set_cursor(0)
+
+    def _navigable_rows(self) -> list[SkillSearchRow]:
+        return list(self.query(SkillSearchRow))
+
+    def _set_cursor(self, idx: int):
+        rows = self._navigable_rows()
+        if not rows:
+            return
+        idx = max(0, min(idx, len(rows) - 1))
+        for r in rows:
+            r.focused = False
+        self._cursor = idx
+        rows[idx].focused = True
+        rows[idx].scroll_visible()
+
+    def on_key(self, event):
+        if event.key in ("j", "down"):
+            self._set_cursor(self._cursor + 1)
+            event.stop()
+        elif event.key in ("k", "up"):
+            self._set_cursor(self._cursor - 1)
+            event.stop()
+        elif event.key == "enter":
+            rows = self._navigable_rows()
+            if rows and self._cursor < len(rows):
+                row = rows[self._cursor]
+                self.app.push_screen(SkillSearchDetailScreen(
+                    skill_name=row.skill_name,
+                    source=row.source,
+                    installs=row.installs,
+                    installed=row.installed,
+                ), self._handle_detail_result)
+            event.stop()
+        elif event.key == "u":
+            rows = self._navigable_rows()
+            if rows and self._cursor < len(rows):
+                row = rows[self._cursor]
+                if not row.installed:
+                    self.dismiss(("install", row.skill_name, row.source, "global"))
+            event.stop()
+        elif event.key == "p":
+            rows = self._navigable_rows()
+            if rows and self._cursor < len(rows):
+                row = rows[self._cursor]
+                if not row.installed:
+                    self.dismiss(("install", row.skill_name, row.source, "project"))
+            event.stop()
+        elif event.key in ("q", "escape"):
+            self.dismiss(None)
+            event.stop()
+
+    def _handle_detail_result(self, result):
+        if result in ("add_user", "add_project"):
+            scope = "global" if result == "add_user" else "project"
+            rows = self._navigable_rows()
+            if rows and self._cursor < len(rows):
+                row = rows[self._cursor]
+                self.dismiss(("install", row.skill_name, row.source, scope))
+
+    def action_close(self):
+        self.dismiss(None)
+
+    DEFAULT_CSS = """
+    SkillsDiscoverScreen {
+        align: center middle;
+    }
+    #skills-discover-box {
+        width: 90%;
+        max-width: 100;
+        height: 85%;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #skills-discover-status {
+        width: 100%;
+        height: auto;
+        margin-bottom: 1;
+    }
+    #skills-discover-list {
+        width: 100%;
+        height: 1fr;
     }
     """
 
@@ -508,12 +898,19 @@ class DetailScreen(ModalScreen):
     BINDINGS = [
         Binding("escape,q", "close", "Close"),
         Binding("d", "delete", "Delete from store"),
+        Binding("c", "copy", "Copy config"),
     ]
 
-    def __init__(self, name: str, cfg: dict):
+    def __init__(self, name: str, cfg: dict, permitted_tools: list[str] | None = None, readonly: bool = False, importable: bool = False, needs_auth: bool = False, claude_dir: Path = CLAUDE_DIR, claude_json: Path | None = None):
         super().__init__()
         self.mcp_name = name
         self.mcp_cfg = cfg
+        self.permitted_tools = set(permitted_tools or [])
+        self.readonly = readonly
+        self.importable = importable
+        self.needs_auth = needs_auth
+        self.claude_dir = claude_dir
+        self.claude_json = claude_json
 
     def compose(self) -> ComposeResult:
         masked = mask_secrets(self.mcp_cfg)
@@ -521,41 +918,354 @@ class DetailScreen(ModalScreen):
 
         lines = [
             f"[bold]{self.mcp_name}[/bold]",
+        ]
+        if self.needs_auth:
+            lines.append("[#d97706]needs authentication[/]")
+        lines += [
             "",
             "[dim]Configuration (secrets masked):[/dim]",
             "",
         ]
         for line in pretty.splitlines():
             lines.append(f"  {line}")
-        lines += [
-            "",
-            "[dim]─────────────────────────────────────────[/dim]",
-            "  [bold]D[/bold]  delete from store",
-            "  [bold]Q / Esc[/bold]  close",
-        ]
 
         with Vertical(id="detail-box"):
-            yield Label("\n".join(lines), id="detail-content")
+            with ScrollableContainer(id="detail-scroll"):
+                yield Label("\n".join(lines), id="detail-content")
+                yield Static("[dim]Loading tools...[/dim]", id="detail-tools")
+            # Pinned action bar at bottom
+            actions = []
+            if self.needs_auth:
+                actions.append("[bold]A[/bold] authenticate")
+            if self.importable:
+                actions.append("[bold]I[/bold] import to store")
+            if not self.readonly:
+                actions.append("[bold]D[/bold] delete")
+            actions.append("[bold]C[/bold] copy config")
+            actions.append("[bold]Q / Esc[/bold] close")
+            yield Static("  " + "   ".join(actions), id="detail-actions")
+
+    def on_mount(self):
+        thread = Thread(target=self._fetch_tools, daemon=True)
+        thread.start()
+
+    def _fetch_tools(self):
+        from .registry import inspect_mcp_tools
+        tools = inspect_mcp_tools(self.mcp_cfg)
+        try:
+            self.app.call_from_thread(self._show_tools, tools)
+        except Exception:
+            pass
+
+    def _show_tools(self, tools: list[dict] | None):
+        try:
+            widget = self.query_one("#detail-tools", Static)
+        except Exception:
+            return
+
+        if tools is None:
+            # Fallback: show permitted tools from settings.local.json
+            if self.permitted_tools:
+                lines = [f"[dim]Permitted tools ({len(self.permitted_tools)}):[/dim]", ""]
+                for name in sorted(self.permitted_tools):
+                    lines.append(f"  [#10b981]✓[/] {name}")
+                lines.insert(0, "[dim]Could not connect · showing permitted tools from settings[/dim]")
+                widget.update("\n".join(lines))
+            else:
+                widget.update("[dim]Could not connect to server[/dim]")
+            return
+        if not tools:
+            widget.update("[dim]No tools exposed[/dim]")
+            return
+
+        lines = [f"[dim]Tools ({len(tools)}):[/dim]", ""]
+        for t in sorted(tools, key=lambda x: x.get("name", "")):
+            name = t.get("name", "")
+            desc = t.get("description", "")
+            if name in self.permitted_tools:
+                indicator = "[#10b981]✓[/]"
+            else:
+                indicator = "[#6b7280]·[/]"
+            line = f"[bold white]{name}[/]"
+            if desc:
+                short_desc = desc[:120] + "…" if len(desc) > 120 else desc
+                line += f"  [dim]{short_desc}[/dim]"
+            lines.append(line)
+
+        if self.permitted_tools:
+            active = sum(1 for t in tools if t.get("name", "") in self.permitted_tools)
+            lines.insert(0, f"[dim]{active}/{len(tools)} permitted[/dim]")
+
+        widget.update("\n".join(lines))
 
     def action_close(self):
         self.dismiss(None)
 
     def action_delete(self):
-        self.dismiss("delete")
+        if not self.readonly:
+            self.dismiss("delete")
+
+    def action_copy(self):
+        """Copy the MCP config JSON to clipboard."""
+        cfg_json = json.dumps({self.mcp_name: self.mcp_cfg}, indent=2)
+        if _copy_to_clipboard(cfg_json):
+            try:
+                widget = self.query_one("#detail-tools", Static)
+                widget.update(widget.renderable + "\n[#10b981]Copied to clipboard![/]")
+            except Exception:
+                pass
+
+    def action_import(self):
+        if self.importable:
+            self.dismiss("import")
+
+    def action_authenticate(self):
+        if not self.needs_auth:
+            return
+        import webbrowser
+        claude_json = self.claude_json or Path.home() / ".claude.json"
+        url = get_connector_auth_url(self.mcp_name, self.claude_dir, claude_json)
+        if url:
+            webbrowser.open(url)
+            self.dismiss("auth_started")
+        else:
+            try:
+                widget = self.query_one("#detail-tools", Static)
+                widget.update("[#ef4444]Could not build auth URL — no server ID found in debug logs[/]")
+            except Exception:
+                pass
+
+    def key_a(self):
+        self.action_authenticate()
+
+    def key_i(self):
+        self.action_import()
 
     DEFAULT_CSS = """
     DetailScreen {
         align: center middle;
     }
     #detail-box {
-        width: 70;
-        height: auto;
-        max-height: 80%;
+        width: 80;
+        height: 85%;
         border: solid $accent;
         padding: 1 2;
     }
+    #detail-scroll {
+        width: 100%;
+        height: 1fr;
+    }
     #detail-content {
         width: 100%;
+        height: auto;
+    }
+    #detail-tools {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+    }
+    #detail-actions {
+        width: 100%;
+        height: 2;
+        dock: bottom;
+        border-top: solid #444444;
+    }
+    """
+
+
+class PluginDetailScreen(ModalScreen):
+    """Detail view for a plugin with metadata from installed_plugins.json."""
+
+    BINDINGS = [
+        Binding("escape,q", "close", "Close"),
+        Binding("e", "toggle", "Toggle enabled"),
+        Binding("d", "delete", "Delete"),
+    ]
+
+    def __init__(self, plugin_id: str, enabled: bool, claude_dir: Path, permitted_tools: list[str] | None = None):
+        super().__init__()
+        self.plugin_id = plugin_id
+        self.display_name = plugin_id.split("@")[0]
+        self.marketplace = plugin_id.split("@")[1] if "@" in plugin_id else ""
+        self.plugin_enabled = enabled
+        self.claude_dir = claude_dir
+        self.permitted_tools = set(permitted_tools or [])
+
+    def compose(self) -> ComposeResult:
+        meta = load_plugin_metadata(self.plugin_id, self.claude_dir)
+
+        lines = [f"[bold]{self.display_name}[/bold]"]
+
+        # Status line
+        state = "[#10b981]enabled[/]" if self.plugin_enabled else "[#6b7280]disabled[/]"
+        lines.append(state)
+
+        # Description
+        desc = meta.get("description", "")
+        if desc:
+            lines += ["", desc]
+
+        # Metadata
+        lines.append("")
+        if meta.get("author"):
+            lines.append(f"[dim]Author:[/dim]       {meta['author']}")
+        if self.marketplace:
+            lines.append(f"[dim]Marketplace:[/dim]   {self.marketplace}")
+        if meta.get("version"):
+            lines.append(f"[dim]Version:[/dim]      {meta['version']}")
+        if meta.get("category"):
+            lines.append(f"[dim]Category:[/dim]     {meta['category']}")
+        if meta.get("homepage"):
+            lines.append(f"[dim]Homepage:[/dim]     {meta['homepage']}")
+        elif meta.get("source_url"):
+            lines.append(f"[dim]Source:[/dim]       {meta['source_url']}")
+        if meta.get("installed_at"):
+            lines.append(f"[dim]Installed:[/dim]    {meta['installed_at'][:10]}")
+        if meta.get("last_updated"):
+            lines.append(f"[dim]Updated:[/dim]      {meta['last_updated'][:10]}")
+        if meta.get("keywords"):
+            lines.append(f"[dim]Keywords:[/dim]     {', '.join(meta['keywords'])}")
+
+        # MCP config
+        mcp_cfg = meta.get("mcp_config", {})
+        if mcp_cfg:
+            lines += ["", "[dim]MCP configuration:[/dim]", ""]
+            masked = mask_secrets(mcp_cfg)
+            for line in json.dumps(masked, indent=2).splitlines():
+                lines.append(f"  {line}")
+
+        with Vertical(id="plugin-detail-box"):
+            with ScrollableContainer(id="plugin-detail-scroll"):
+                yield Label("\n".join(lines), id="plugin-detail-content")
+                yield Static("[dim]Loading tools...[/dim]", id="plugin-detail-tools")
+            # Pinned actions
+            toggle_label = "disable" if self.plugin_enabled else "enable"
+            yield Static(
+                f"  [bold]E[/bold] {toggle_label}   [bold]D[/bold] delete   [bold]C[/bold] copy config   [bold]Q / Esc[/bold] close",
+                id="plugin-detail-actions",
+            )
+
+    def on_mount(self):
+        if self.permitted_tools:
+            self._show_permitted_tools()
+        else:
+            # Try to fetch tools via MCP protocol
+            meta = load_plugin_metadata(self.plugin_id, self.claude_dir)
+            mcp_cfg = meta.get("mcp_config", {})
+            if mcp_cfg:
+                # MCP config has server names as keys, pick the first
+                first_cfg = next(iter(mcp_cfg.values()), {})
+                if first_cfg:
+                    thread = Thread(target=self._fetch_tools, args=(first_cfg,), daemon=True)
+                    thread.start()
+                    return
+            try:
+                self.query_one("#plugin-detail-tools", Static).update("")
+            except Exception:
+                pass
+
+    def _fetch_tools(self, cfg: dict):
+        from .registry import inspect_mcp_tools
+        tools = inspect_mcp_tools(cfg)
+        try:
+            self.app.call_from_thread(self._show_tools, tools)
+        except Exception:
+            pass
+
+    def _show_tools(self, tools: list[dict] | None):
+        try:
+            widget = self.query_one("#plugin-detail-tools", Static)
+        except Exception:
+            return
+        if tools is None:
+            if self.permitted_tools:
+                self._show_permitted_tools()
+            else:
+                widget.update("[dim]Could not connect to server[/dim]")
+            return
+        if not tools:
+            widget.update("[dim]No tools exposed[/dim]")
+            return
+
+        lines = [f"[dim]Tools ({len(tools)}):[/dim]", ""]
+        for t in sorted(tools, key=lambda x: x.get("name", "")):
+            name = t.get("name", "")
+            desc = t.get("description", "")
+            indicator = "[#10b981]✓[/]" if name in self.permitted_tools else "[#6b7280]·[/]"
+            line = f"[bold white]{name}[/]"
+            if desc:
+                short_desc = desc[:120] + "…" if len(desc) > 120 else desc
+                line += f"  [dim]{short_desc}[/dim]"
+            lines.append(line)
+
+        if self.permitted_tools:
+            active = sum(1 for t in tools if t.get("name", "") in self.permitted_tools)
+            lines.insert(0, f"[dim]{active}/{len(tools)} permitted[/dim]")
+
+        widget.update("\n".join(lines))
+
+    def _show_permitted_tools(self):
+        try:
+            widget = self.query_one("#plugin-detail-tools", Static)
+        except Exception:
+            return
+        lines = [f"[dim]Permitted tools ({len(self.permitted_tools)}):[/dim]", ""]
+        for name in sorted(self.permitted_tools):
+            lines.append(f"  [#10b981]✓[/] {name}")
+        widget.update("\n".join(lines))
+
+    def action_close(self):
+        self.dismiss(None)
+
+    def action_toggle(self):
+        self.dismiss("toggle")
+
+    def action_delete(self):
+        self.dismiss("delete")
+
+    def key_c(self):
+        """Copy plugin MCP config to clipboard."""
+        meta = load_plugin_metadata(self.plugin_id, self.claude_dir)
+        mcp_cfg = meta.get("mcp_config", {})
+        if mcp_cfg:
+            cfg_json = json.dumps(mcp_cfg, indent=2)
+        else:
+            cfg_json = self.plugin_id
+        if _copy_to_clipboard(cfg_json):
+            try:
+                widget = self.query_one("#plugin-detail-tools", Static)
+                widget.update(widget.renderable + "\n[#10b981]Copied to clipboard![/]")
+            except Exception:
+                pass
+
+    DEFAULT_CSS = """
+    PluginDetailScreen {
+        align: center middle;
+    }
+    #plugin-detail-box {
+        width: 80;
+        height: 85%;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #plugin-detail-scroll {
+        width: 100%;
+        height: 1fr;
+    }
+    #plugin-detail-content {
+        width: 100%;
+        height: auto;
+    }
+    #plugin-detail-tools {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+    }
+    #plugin-detail-actions {
+        width: 100%;
+        height: 2;
+        dock: bottom;
+        border-top: solid #444444;
     }
     """
 
@@ -615,9 +1325,10 @@ class SearchResultDetailScreen(ModalScreen):
             lines.append("  [#10b981]Already in store[/]")
         else:
             lines.append("  [bold]A[/bold]  add to store")
+        lines.append("  [bold]C[/bold]  copy config")
         lines.append("  [bold]Q / Esc[/bold]  close")
 
-        with Vertical(id="search-detail-box"):
+        with ScrollableContainer(id="search-detail-box"):
             yield Label("\n".join(lines), id="search-detail-content")
 
     def action_close(self):
@@ -626,6 +1337,18 @@ class SearchResultDetailScreen(ModalScreen):
     def action_add(self):
         if not self.already_in_store:
             self.dismiss("add")
+
+    def key_c(self):
+        """Copy the MCP config JSON to clipboard."""
+        cfg = self.result.to_mcp_config()
+        name = normalize_server_name(self.result.name)
+        cfg_json = json.dumps({name: cfg}, indent=2)
+        if _copy_to_clipboard(cfg_json):
+            try:
+                widget = self.query_one("#search-detail-content", Label)
+                widget.update(widget.renderable + "\n[#10b981]Copied config to clipboard![/]")
+            except Exception:
+                pass
 
     DEFAULT_CSS = """
     SearchResultDetailScreen {
@@ -640,6 +1363,7 @@ class SearchResultDetailScreen(ModalScreen):
     }
     #search-detail-content {
         width: 100%;
+        height: auto;
     }
     """
 
@@ -686,10 +1410,11 @@ class DiscoverDetailScreen(ModalScreen):
             "",
             "[dim]──────────────────────────────────────────────[/dim]",
             "  [bold]A[/bold]  add to store (will use npx with package name)",
+            "  [bold]C[/bold]  copy server name",
             "  [bold]Q / Esc[/bold]  close",
         ]
 
-        with Vertical(id="discover-detail-box"):
+        with ScrollableContainer(id="discover-detail-box"):
             yield Label("\n".join(lines), id="discover-detail-content")
 
     def action_close(self):
@@ -697,6 +1422,19 @@ class DiscoverDetailScreen(ModalScreen):
 
     def action_add(self):
         self.dismiss("add")
+
+    def key_c(self):
+        """Copy server info to clipboard."""
+        s = self.server
+        parts = [s.name]
+        if s.url:
+            parts.append(s.url)
+        if _copy_to_clipboard("\n".join(parts)):
+            try:
+                widget = self.query_one("#discover-detail-content", Label)
+                widget.update(widget.renderable + "\n[#10b981]Copied to clipboard![/]")
+            except Exception:
+                pass
 
     DEFAULT_CSS = """
     DiscoverDetailScreen {
@@ -711,6 +1449,7 @@ class DiscoverDetailScreen(ModalScreen):
     }
     #discover-detail-content {
         width: 100%;
+        height: auto;
     }
     """
 
@@ -729,6 +1468,10 @@ class ManCPApp(App):
     }
     #search-input {
         margin: 0 1 1 1;
+        border: tall #FFDE02;
+    }
+    #search-input:focus {
+        border: tall #FFDE02;
     }
     #search-col-header {
         height: 1;
@@ -784,12 +1527,16 @@ class ManCPApp(App):
     SkillRow {
         height: 1;
     }
+    SkillSearchRow {
+        height: 1;
+    }
     #skills-panel {
         height: 1fr;
         padding: 0 1;
     }
-    #skills-search-input {
-        margin: 0 1 1 1;
+    #skills-col-header {
+        height: 1;
+        padding: 0 1;
     }
     #skills-status {
         height: 1;
@@ -799,6 +1546,14 @@ class ManCPApp(App):
         height: 1fr;
         padding: 0 1;
         scrollbar-size: 0 0;
+    }
+    #search-sub-nav {
+        height: 1;
+        padding: 0 1;
+    }
+    #discover-sub-nav {
+        height: 1;
+        padding: 0 1;
     }
     .readonly-hint {
         height: 1;
@@ -821,11 +1576,12 @@ class ManCPApp(App):
     #status-bar {
         height: 1;
         padding: 0 1;
+        dock: bottom;
     }
     #footer-hints {
-        height: 1;
+        height: 2;
         padding: 0 1;
-        margin-top: 1;
+        dock: bottom;
         border-top: solid #444444;
     }
     .hidden {
@@ -841,12 +1597,13 @@ class ManCPApp(App):
         Binding("e", "toggle_enabled", "Toggle plugin enabled", show=False),
         Binding("enter", "select_or_detail", "Select/Detail", show=False),
         Binding("d", "delete", "Delete from store", show=False),
+        Binding("i", "import_desktop", "Import from Desktop", show=False),
         Binding("s", "apply", "Save", show=False),
         Binding("ctrl+s", "apply", "Save", show=False),
         Binding("q,escape", "quit_app", "Quit", show=False),
     ]
 
-    TABS = ["servers", "search", "discover", "skills"]
+    TABS = ["servers", "skills", "search", "discover"]
 
     def __init__(self, store: dict, cwd: Path, store_file=None, claude_json=None, claude_dir=None, settings_json=None):
         super().__init__()
@@ -862,6 +1619,8 @@ class ManCPApp(App):
         self.project_active = get_project_scope_mcps(cwd)
         self.plugins = get_plugins(self.settings_json)
         self.readonly_mcps = collect_readonly_mcps(self.claude_dir)
+        self.desktop_mcp_configs = get_desktop_mcps()
+        self.desktop_extensions = {e["display_name"]: e for e in get_desktop_extensions()}
         self.tool_counts = count_mcp_tools(self.claude_dir)
         self.cached_tool_counts = load_tool_counts_cache()
         self.names = sorted(store.keys())
@@ -879,6 +1638,8 @@ class ManCPApp(App):
         self._input_focused = False
         self.skills_cursor = 0
         self.skills_loaded = False
+        self.search_mode = "mcps"  # "mcps" or "skills"
+        self.discover_mode = "mcps"  # "mcps" or "skills"
 
     def compose(self) -> ComposeResult:
         cwd_name = self.cwd.name
@@ -904,8 +1665,18 @@ class ManCPApp(App):
             yield from self._plugin_widgets()
             yield from self._readonly_widgets()
 
+        # -- Skills tab (hidden initially) --
+        with Vertical(id="skills-panel", classes="hidden"):
+            yield Label(
+                "  [bold]U[/]  [bold]P[/]  name                        [bold]ctx[/]  description",
+                id="skills-col-header",
+            )
+            yield Static("  [dim]Loading skills...[/dim]", id="skills-status")
+            yield ScrollableContainer(id="skills-results", can_focus=False)
+
         # -- Search tab (hidden initially) --
         with Vertical(id="search-panel", classes="hidden"):
+            yield Label(self._render_search_sub_nav(), id="search-sub-nav")
             yield Input(placeholder="Search MCP servers (GitHub MCP org + Registry)...", id="search-input", disabled=True)
             yield Label(
                 "  [bold]✓[/]  name                       [bold]type[/]   registry / description",
@@ -916,18 +1687,13 @@ class ManCPApp(App):
 
         # -- Discover tab (hidden initially) --
         with Vertical(id="discover-panel", classes="hidden"):
+            yield Label(self._render_discover_sub_nav(), id="discover-sub-nav")
             yield Static("  [bold]Discover MCP servers[/bold]", id="discover-status")
             yield Label(
                 f"     {'name':<{NAME_WIDTH}}     [bold]★[/]  [bold]lang[/]  description",
                 id="discover-col-header",
             )
             yield ScrollableContainer(id="discover-results", can_focus=False)
-
-        # -- Skills tab (hidden initially) --
-        with Vertical(id="skills-panel", classes="hidden"):
-            yield Input(placeholder="Search skills (skills.sh)...", id="skills-search-input", disabled=True)
-            yield Static("  [dim]Loading skills...[/dim]", id="skills-status")
-            yield ScrollableContainer(id="skills-results", can_focus=False)
 
         yield Static("", id="status-bar")
         yield Label(self._footer_for_tab(), id="footer-hints")
@@ -973,34 +1739,53 @@ class ManCPApp(App):
         tab_str = "  ".join(tabs)
         return f"  [bold]mancp[/bold]  {cwd_name}  [dim]{store_count} in store[/dim]   {tab_str}"
 
+    def _render_search_sub_nav(self) -> str:
+        if self.search_mode == "mcps":
+            return "  [bold #FFDE02] MCPs [/]  [dim] Skills [/]  [dim]· tab to switch[/dim]"
+        return "  [dim] MCPs [/]  [bold #FFDE02] Skills [/]  [dim]· tab to switch[/dim]"
+
+    def _render_discover_sub_nav(self) -> str:
+        if self.discover_mode == "mcps":
+            return "  [bold #FFDE02] MCPs [/]  [dim] Skills [/]  [dim]· tab to switch[/dim]"
+        return "  [dim] MCPs [/]  [bold #FFDE02] Skills [/]  [dim]· tab to switch[/dim]"
+
     def _footer_for_tab(self) -> str:
         if self.active_tab == "servers":
             return (
                 "  [dim]j/k[/dim] navigate   [dim]u[/dim] user   [dim]p[/dim] project   "
                 "[dim]e[/dim] enable   [dim]enter[/dim] detail   [dim]d[/dim] delete   "
-                "[dim]s[/dim] save   [dim]→[/dim] search   [dim]q[/dim] quit"
-            )
-        if self.active_tab == "search":
-            return (
-                "  [dim]type[/dim] to search   [dim]tab[/dim] results   "
-                "[dim]j/k[/dim] navigate   [dim]enter[/dim] detail   "
-                "[dim]←[/dim] servers   [dim]→[/dim] discover   [dim]q[/dim] quit"
+                "[dim]s[/dim] save   [dim]→[/dim] skills   [dim]q[/dim] quit"
             )
         if self.active_tab == "skills":
             return (
-                "  [dim]type[/dim] to search   [dim]tab[/dim] results   "
+                "  [dim]j/k[/dim] navigate   [dim]u[/dim] user   [dim]p[/dim] project   "
+                "[dim]e[/dim] enable   [dim]enter[/dim] detail   [dim]d[/dim] remove   "
+                "[dim]←[/dim] servers   [dim]→[/dim] search   [dim]q[/dim] quit"
+            )
+        if self.active_tab == "search":
+            return (
+                "  [dim]type[/dim] to search   [dim]tab[/dim] mcps/skills   "
                 "[dim]j/k[/dim] navigate   [dim]enter[/dim] detail   "
-                "[dim]d[/dim] remove   [dim]←[/dim] discover   [dim]q[/dim] quit"
+                "[dim]←[/dim] skills   [dim]→[/dim] discover   [dim]q[/dim] quit"
             )
         # discover
-        if self.discover_view == "categories":
+        if self.discover_mode == "mcps" and self.discover_view == "categories":
             return (
                 "  [dim]j/k[/dim] navigate   [dim]enter[/dim] select   "
-                "[dim]r[/dim] refresh   [dim]←[/dim] search   [dim]→[/dim] skills   [dim]q[/dim] quit"
+                "[dim]tab[/dim] mcps/skills   "
+                "[dim]r[/dim] refresh   [dim]←[/dim] search   [dim]q[/dim] quit"
+            )
+        if self.discover_mode == "skills":
+            return (
+                "  [dim]j/k[/dim] navigate   [dim]enter[/dim] detail   "
+                "[dim]u[/dim] user   [dim]p[/dim] project   "
+                "[dim]tab[/dim] mcps/skills   "
+                "[dim]←[/dim] search   [dim]q[/dim] quit"
             )
         return (
             "  [dim]j/k[/dim] navigate   [dim]enter[/dim] detail   "
-            "[dim]esc[/dim] back   [dim]←[/dim] search   [dim]→[/dim] skills   [dim]q[/dim] quit"
+            "[dim]tab[/dim] mcps/skills   "
+            "[dim]esc[/dim] back   [dim]←[/dim] search   [dim]q[/dim] quit"
         )
 
     def _switch_tab(self, tab: str):
@@ -1010,45 +1795,42 @@ class ManCPApp(App):
 
         mcp_list = self.query_one("#mcp-list", ScrollableContainer)
         col_header = self.query_one("#col-header", Label)
+        skills_panel = self.query_one("#skills-panel", Vertical)
         search_panel = self.query_one("#search-panel", Vertical)
         discover_panel = self.query_one("#discover-panel", Vertical)
-        skills_panel = self.query_one("#skills-panel", Vertical)
         search_input = self.query_one("#search-input", Input)
-        skills_search_input = self.query_one("#skills-search-input", Input)
 
         # Hide all
         mcp_list.add_class("hidden")
         col_header.add_class("hidden")
+        skills_panel.add_class("hidden")
         search_panel.add_class("hidden")
         discover_panel.add_class("hidden")
-        skills_panel.add_class("hidden")
         if search_input.has_focus:
             search_input.blur()
         search_input.disabled = True
-        if skills_search_input.has_focus:
-            skills_search_input.blur()
-        skills_search_input.disabled = True
         self._input_focused = False
 
         if tab == "servers":
             mcp_list.remove_class("hidden")
             col_header.remove_class("hidden")
+        elif tab == "skills":
+            skills_panel.remove_class("hidden")
+            if not self.skills_loaded:
+                self._load_skills()
         elif tab == "search":
             search_panel.remove_class("hidden")
             search_input.disabled = False
             search_input.focus()
             self._input_focused = True
+            self._update_search_placeholder()
         elif tab == "discover":
             discover_panel.remove_class("hidden")
-            if not self.query(CategoryRow) and not self.query(DiscoverRow):
-                self._show_categories()
-        elif tab == "skills":
-            skills_panel.remove_class("hidden")
-            skills_search_input.disabled = False
-            skills_search_input.focus()
-            self._input_focused = True
-            if not self.skills_loaded:
-                self._load_skills()
+            if self.discover_mode == "mcps":
+                if not self.query(CategoryRow) and not self.query(DiscoverRow):
+                    self._show_categories()
+            else:
+                self._show_skills_discover()
 
         self.query_one("#tab-bar", Label).update(self._render_tab_bar())
         self.query_one("#footer-hints", Label).update(self._footer_for_tab())
@@ -1074,12 +1856,12 @@ class ManCPApp(App):
         self._set_discover_cursor(0)
         self.query_one("#footer-hints", Label).update(self._footer_for_tab())
 
-    def _navigable_discover_rows(self) -> list[DiscoverRow | CategoryRow | MoreRow]:
+    def _navigable_discover_rows(self) -> list[DiscoverRow | CategoryRow | MoreRow | SkillSearchRow]:
         """All navigable rows in discover tab, in DOM order."""
         container = self.query_one("#discover-results", ScrollableContainer)
         return [
             w for w in container.children
-            if isinstance(w, (DiscoverRow, CategoryRow, MoreRow))
+            if isinstance(w, (DiscoverRow, CategoryRow, MoreRow, SkillSearchRow))
         ]
 
     def _set_discover_cursor(self, idx: int):
@@ -1197,8 +1979,8 @@ class ManCPApp(App):
             container.mount(MoreRow(label="more...", section="category"))
 
     def _discover_back(self):
-        """Go back from category server list to categories."""
-        if self.discover_view == "servers":
+        """Go back from category server list to categories, or to search tab."""
+        if self.discover_mode == "mcps" and self.discover_view == "servers":
             self._show_categories()
         else:
             self._switch_tab("search")
@@ -1246,111 +2028,69 @@ class ManCPApp(App):
                 current.in_store = True
                 current.refresh()
 
+    def _import_desktop_mcp(self, name: str, cfg: dict):
+        """Import a Claude Desktop MCP config into the mancp store."""
+        if name in self.store:
+            self.query_one("#status-bar", Static).update(f"  '{name}' already in store")
+            return
+        self.store[name] = cfg
+        save_store(self.store, self.store_file)
+        self.names = sorted(self.store.keys())
+        self._rebuild_list()
+        self.query_one("#tab-bar", Label).update(self._render_tab_bar())
+        self.query_one("#status-bar", Static).update(
+            f"  + {name} imported from Claude Desktop"
+        )
+
     # -- Skills tab --
 
-    def _load_skills(self, status_override: str = ""):
-        """Load installed skills and discover skills in background."""
+    def _load_skills(self):
+        """Load installed skills in background."""
         self.skills_loaded = True
-        self._skills_status_override = status_override
-        if not status_override:
-            self.query_one("#skills-status", Static).update("  [dim]Loading skills from skills.sh...[/dim]")
+        self.query_one("#skills-status", Static).update("  [dim]Loading skills...[/dim]")
         thread = Thread(target=self._do_load_skills, daemon=True)
         thread.start()
 
     def _do_load_skills(self):
-        installed = get_installed_skills()
-        discover = fetch_skills_discover(count=25)
-        self.call_from_thread(self._show_skills, installed, discover)
+        installed = get_installed_skills(cwd=self.cwd)
+        self.call_from_thread(self._show_skills, installed)
 
-    def _show_skills(self, installed: list[dict], discover: list[Skill]):
+    def _show_skills(self, installed: list[dict]):
+        from .registry import estimate_skills_menu_tokens, estimate_skill_tokens
         installed_names = {s["name"] for s in installed}
         self._skills_installed_names = installed_names
         container = self.query_one("#skills-results", ScrollableContainer)
         container.remove_children()
         self.skills_cursor = 0
 
-        # Installed skills section
         self._all_installed_skills = installed
-        INSTALLED_INITIAL = 5
-        if installed:
-            container.mount(Label(
-                f" [dim]── installed ({len(installed)}) ──[/dim]",
-                classes="readonly-header",
-            ))
-            for s in installed[:INSTALLED_INITIAL]:
-                row = SkillRow(
-                    skill_name=s["name"],
-                    source="local",
-                    installed=True,
-                    description=s["description"],
-                )
-                container.mount(row)
-            if len(installed) > INSTALLED_INITIAL:
-                container.mount(MoreRow(
-                    label=f"more... ({len(installed) - INSTALLED_INITIAL} hidden)",
-                    section="installed",
-                ))
+        enabled_count = sum(1 for s in installed if not s.get("disabled", False))
 
-        # Discover section
-        if discover:
-            container.mount(Label(
-                f" [dim]── discover (skills.sh trending + all time) ──[/dim]",
-                classes="readonly-header",
-            ))
-            for s in discover:
-                row = SkillRow(
-                    skill_name=s.name,
-                    source=s.source,
-                    installs=s.installs,
-                    installed=s.name in installed_names,
-                )
-                container.mount(row)
-            # "more..." row to load additional skills
-            container.mount(MoreRow(label="more...", section="skills"))
-
-        status = getattr(self, "_skills_status_override", "")
-        if status:
-            self.query_one("#skills-status", Static).update(status)
-            self._skills_status_override = ""
-        else:
-            self.query_one("#skills-status", Static).update(
-                f"  [bold]Skills[/bold]  [dim]{len(installed)} installed, {len(discover)} to discover[/dim]"
-            )
-        self._set_skills_cursor(0)
-
-    def _do_search_skills(self, query: str):
-        results = search_skills(query)
-        installed = get_installed_skills()
-        self.call_from_thread(self._show_skills_search_results, results, installed)
-
-    def _show_skills_search_results(self, results: list[Skill], installed: list[dict]):
-        installed_names = {s["name"] for s in installed}
-        container = self.query_one("#skills-results", ScrollableContainer)
-        container.remove_children()
-        self.skills_cursor = 0
-
-        if not results:
-            self.query_one("#skills-status", Static).update("  No skills found. Try a different query.")
-            return
-
-        self.query_one("#skills-status", Static).update(
-            f"  [bold]{len(results)} skills found[/bold]"
-        )
-        for s in results[:30]:
+        for s in installed:
+            tokens = estimate_skill_tokens(s.get("skill_md_size", 0))
             row = SkillRow(
-                skill_name=s.name,
-                source=s.source,
-                installs=s.installs,
-                installed=s.name in installed_names,
+                skill_name=s["name"],
+                source=s.get("source_repo", "") or "local",
+                in_user=s.get("in_user", False),
+                in_project=s.get("in_project", False),
+                disabled=s.get("disabled", False),
+                description=s.get("description", ""),
+                token_estimate=tokens,
             )
             container.mount(row)
+
+        menu_tokens = estimate_skills_menu_tokens(installed)
+        mtk = f"{menu_tokens // 1000}k" if menu_tokens >= 1000 else str(menu_tokens)
+        self.query_one("#skills-status", Static).update(
+            f"  [bold]Skills[/bold]  [dim]{len(installed)} installed · {enabled_count} enabled · menu ~{mtk} tokens/conversation[/dim]"
+        )
         self._set_skills_cursor(0)
 
-    def _navigable_skill_rows(self) -> list[SkillRow | MoreRow]:
+    def _navigable_skill_rows(self) -> list[SkillRow]:
         container = self.query_one("#skills-results", ScrollableContainer)
         return [
             w for w in container.children
-            if isinstance(w, (SkillRow, MoreRow))
+            if isinstance(w, SkillRow)
         ]
 
     def _skill_rows(self) -> list[SkillRow]:
@@ -1372,145 +2112,112 @@ class ManCPApp(App):
         rows = self._navigable_skill_rows()
         if not rows or self.skills_cursor >= len(rows):
             return
-        current = rows[self.skills_cursor]
-        if isinstance(current, MoreRow):
-            if current.section == "installed":
-                self._expand_installed_skills()
-            else:
-                self._load_more_skills()
-        elif isinstance(current, SkillRow):
-            self._show_skill_detail()
+        self._show_skill_detail()
 
     def _show_skill_detail(self):
-        rows = self._skill_rows()
-        if not rows or self.skills_cursor >= len(self._navigable_skill_rows()):
+        rows = self._navigable_skill_rows()
+        if not rows or self.skills_cursor >= len(rows):
             return
-        current = self._navigable_skill_rows()[self.skills_cursor]
-        if not isinstance(current, SkillRow):
-            return
-        row = current
+        row = rows[self.skills_cursor]
 
         def handle_result(result):
-            if result == "add":
-                self._install_skill(row)
-            elif result == "delete":
+            if result == "delete":
                 self._remove_skill(row)
+            elif result == "toggle_enabled":
+                self._toggle_skill_enabled(row)
 
         self.push_screen(SkillDetailScreen(
             skill_name=row.skill_name,
             source=row.source,
-            installs=row.installs,
-            installed=row.installed,
+            in_user=row.in_user,
+            in_project=row.in_project,
+            disabled=row.disabled,
             description=row.description,
+            token_estimate=row.token_estimate,
         ), handle_result)
 
-    def _expand_installed_skills(self):
-        """Show all installed skills (expand from initial 5)."""
-        container = self.query_one("#skills-results", ScrollableContainer)
-        # Remove the "more..." row for installed
-        more_row = None
-        for w in container.children:
-            if isinstance(w, MoreRow) and w.section == "installed":
-                more_row = w
-                break
-        if not more_row:
-            return
-        # Insert remaining installed skills before the more_row, then remove it
-        all_installed = getattr(self, "_all_installed_skills", [])
-        for s in all_installed[5:]:
-            row = SkillRow(
-                skill_name=s["name"],
-                source="local",
-                installed=True,
-                description=s["description"],
-            )
-            container.mount(row, before=more_row)
-        more_row.remove()
+    def _install_skill(self, skill_name: str, source: str, scope: str = "global"):
+        """Install a skill via npx skills add.
 
-    def _load_more_skills(self):
-        """Load more discover skills in background."""
-        self.query_one("#skills-status", Static).update("  [dim]Loading more skills...[/dim]")
-        # Remove the MoreRow
-        for w in self.query_one("#skills-results", ScrollableContainer).children:
-            if isinstance(w, MoreRow) and w.section == "skills":
-                w.remove()
-                break
-        thread = Thread(target=self._do_load_more_skills, daemon=True)
-        thread.start()
-
-    def _do_load_more_skills(self):
-        # Fetch a larger batch
-        more = fetch_skills_discover(count=75)
-        self.call_from_thread(self._append_more_skills, more)
-
-    def _append_more_skills(self, all_skills: list[Skill]):
-        container = self.query_one("#skills-results", ScrollableContainer)
-        installed_names = getattr(self, "_skills_installed_names", set())
-        # Get currently shown skill keys to avoid duplicates
-        existing = {(r.skill_name, r.source) for r in self.query(SkillRow) if not r.installed}
-        added = 0
-        for s in all_skills:
-            if (s.name, s.source) not in existing:
-                row = SkillRow(
-                    skill_name=s.name,
-                    source=s.source,
-                    installs=s.installs,
-                    installed=s.name in installed_names,
-                )
-                container.mount(row)
-                added += 1
-        total_discover = len([r for r in self.query(SkillRow) if not r.installed])
-        self.query_one("#skills-status", Static).update(
-            f"  [bold]Skills[/bold]  [dim]{total_discover} to discover[/dim]"
-        )
-
-    def _install_skill(self, row: SkillRow):
-        """Install a skill via npx skills add."""
-        import subprocess
-        source = row.source
-        self.query_one("#skills-status", Static).update(f"  Installing {row.skill_name}...")
+        scope: "global" (default, installs to ~/.claude/skills) or "project"
+        (installs to <cwd>/.claude/skills via .agents/skills).
+        """
+        scope_label = "user" if scope == "global" else "project"
+        self._notify(f"  Installing {skill_name} ({scope_label})...")
 
         def do_install():
             try:
+                cmd = [
+                    "npx", "skills", "add", source,
+                    "--yes", "--agent", "claude-code",
+                    "--skill", skill_name,
+                ]
+                if scope == "global":
+                    cmd.append("--global")
                 result = subprocess.run(
-                    ["npx", "skills", "add", "--yes", "--all", "--global", source],
+                    cmd,
                     capture_output=True, text=True, timeout=60,
+                    cwd=str(self.cwd) if scope == "project" else None,
                 )
                 success = result.returncode == 0
-                msg = result.stdout.strip() or result.stderr.strip()
+                msg = _clean_skills_output(result.stdout or result.stderr)
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 success = False
                 msg = str(e)
-            self.call_from_thread(self._on_skill_installed, row, success, msg)
+            self.call_from_thread(self._on_skill_installed, skill_name, success, msg, scope)
 
         thread = Thread(target=do_install, daemon=True)
         thread.start()
 
-    def _on_skill_installed(self, row: SkillRow, success: bool, msg: str):
+    def _on_skill_installed(self, skill_name: str, success: bool, msg: str, scope: str = "global"):
         if success:
-            # Reload the full skills view to show it in the installed section
+            scope_label = "user" if scope == "global" else "project"
             self.skills_loaded = False
-            self._load_skills(status_override=f"  [#10b981]✓[/] Installed {row.skill_name}")
+            self._load_skills()
+            self._notify(f"  [#10b981]✓[/] Installed {skill_name} ({scope_label})")
         else:
-            self.query_one("#skills-status", Static).update(
-                f"  [#ef4444]✗[/] Failed: {msg[:60]}"
-            )
+            self._notify(f"  [#ef4444]✗[/] Failed: {msg[:60]}")
+
+    def _notify(self, message: str):
+        """Show a notification in the central status bar (bottom)."""
+        self.query_one("#status-bar", Static).update(message)
 
     def _remove_skill(self, row: SkillRow):
-        """Remove an installed skill via npx skills remove."""
-        import subprocess
+        """Remove an installed skill via npx skills remove.
+
+        Removes from all scopes where it's installed.
+        """
+        scopes_to_remove = []
+        if row.in_user:
+            scopes_to_remove.append("global")
+        if row.in_project:
+            scopes_to_remove.append("project")
+        if not scopes_to_remove:
+            scopes_to_remove = ["global"]
 
         def do_remove():
-            try:
-                result = subprocess.run(
-                    ["npx", "skills", "remove", "--yes", "--global", row.skill_name],
-                    capture_output=True, text=True, timeout=30,
-                )
-                success = result.returncode == 0
-                msg = result.stdout.strip() or result.stderr.strip()
-            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-                success = False
-                msg = str(e)
+            success = True
+            msg = ""
+            for scope in scopes_to_remove:
+                try:
+                    cmd = [
+                        "npx", "skills", "remove",
+                        "--yes", "--agent", "claude-code",
+                        "--skill", row.skill_name,
+                    ]
+                    if scope == "global":
+                        cmd.append("--global")
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True, text=True, timeout=30,
+                        cwd=str(self.cwd) if scope == "project" else None,
+                    )
+                    if result.returncode != 0:
+                        success = False
+                        msg = _clean_skills_output(result.stdout or result.stderr)
+                except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                    success = False
+                    msg = str(e)
             self.call_from_thread(self._on_skill_removed, row, success, msg)
 
         thread = Thread(target=do_remove, daemon=True)
@@ -1518,13 +2225,85 @@ class ManCPApp(App):
 
     def _on_skill_removed(self, row: SkillRow, success: bool, msg: str):
         if success:
-            # Reload the full skills view to remove it from the installed section
             self.skills_loaded = False
-            self._load_skills(status_override=f"  Removed {row.skill_name}")
+            self._load_skills()
+            self._notify(f"  Removed {row.skill_name}")
         else:
-            self.query_one("#skills-status", Static).update(
-                f"  [#ef4444]✗[/] Failed: {msg[:60]}"
+            self._notify(f"  [#ef4444]✗[/] Failed: {msg[:60]}")
+
+    def _remove_skill_scope(self, row: SkillRow, scope: str):
+        """Remove a skill from a single scope."""
+        scope_label = "user" if scope == "global" else "project"
+        self._notify(f"  Removing {row.skill_name} from {scope_label}...")
+
+        def do_remove():
+            try:
+                cmd = [
+                    "npx", "skills", "remove",
+                    "--yes", "--agent", "claude-code",
+                    "--skill", row.skill_name,
+                ]
+                if scope == "global":
+                    cmd.append("--global")
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(self.cwd) if scope == "project" else None,
+                )
+                success = result.returncode == 0
+                msg = _clean_skills_output(result.stdout or result.stderr)
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                success = False
+                msg = str(e)
+            self.call_from_thread(self._on_skill_scope_removed, row, scope, success, msg)
+
+        thread = Thread(target=do_remove, daemon=True)
+        thread.start()
+
+    def _on_skill_scope_removed(self, row: SkillRow, scope: str, success: bool, msg: str):
+        if success:
+            self.skills_loaded = False
+            scope_label = "user" if scope == "global" else "project"
+            self._load_skills()
+            self._notify(f"  Removed {row.skill_name} from {scope_label}")
+        else:
+            self._notify(f"  [#ef4444]✗[/] Failed: {msg[:60]}")
+
+    def _toggle_skill_enabled(self, row: SkillRow):
+        """Toggle a skill's enabled/disabled state in-place."""
+        from .store import disable_skill, enable_skill
+        # Toggle in all scopes where the skill is installed
+        success = False
+        if row.in_project:
+            if row.disabled:
+                success = enable_skill(row.skill_name, cwd=self.cwd, scope="project")
+            else:
+                success = disable_skill(row.skill_name, cwd=self.cwd, scope="project")
+        if row.in_user:
+            if row.disabled:
+                success = enable_skill(row.skill_name, scope="global") or success
+            else:
+                success = disable_skill(row.skill_name, scope="global") or success
+
+        action = "Enabled" if row.disabled else "Disabled"
+
+        if success:
+            row.disabled = not row.disabled
+            row.refresh()
+            for s in getattr(self, "_all_installed_skills", []):
+                if s["name"] == row.skill_name:
+                    s["disabled"] = row.disabled
+                    break
+            installed = getattr(self, "_all_installed_skills", [])
+            enabled_count = sum(1 for s in installed if not s.get("disabled", False))
+            from .registry import estimate_skills_menu_tokens
+            menu_tokens = estimate_skills_menu_tokens(installed)
+            mtk = f"{menu_tokens // 1000}k" if menu_tokens >= 1000 else str(menu_tokens)
+            self._notify(
+                f"  {action} {row.skill_name}  [dim]·  {enabled_count} enabled  ·  menu ~{mtk} tokens/conversation[/dim]"
             )
+        else:
+            self._notify(f"  [#ef4444]✗[/] Failed to toggle {row.skill_name}")
 
     # -- Search input handlers --
 
@@ -1532,8 +2311,8 @@ class ManCPApp(App):
         query = event.value.strip()
         if not query:
             return
-        if event.input.id == "skills-search-input":
-            self.query_one("#skills-status", Static).update("  Searching skills...")
+        if self.search_mode == "skills":
+            self.query_one("#search-status", Static).update("  Searching skills...")
             thread = Thread(target=self._do_search_skills, args=(query,), daemon=True)
             thread.start()
             return
@@ -1587,7 +2366,7 @@ class ManCPApp(App):
         return list(self.query(SearchResultRow))
 
     def _set_search_cursor(self, idx: int):
-        rows = self._search_result_rows()
+        rows = self._search_result_rows() if self.search_mode == "mcps" else self._search_skill_rows()
         if not rows:
             return
         idx = max(0, min(idx, len(rows) - 1))
@@ -1635,6 +2414,158 @@ class ManCPApp(App):
             f"  + {name} ({result.package}) added to store"
         )
 
+    # -- Search skills support --
+
+    def _do_search_skills(self, query: str):
+        results = search_skills(query, cwd=self.cwd)
+        installed = get_installed_skills(cwd=self.cwd)
+        self.call_from_thread(self._show_skills_search_results, results, installed)
+
+    def _show_skills_search_results(self, results: list, installed: list[dict]):
+        installed_names = {s["name"] for s in installed}
+        container = self.query_one("#search-results", ScrollableContainer)
+        container.remove_children()
+        self.search_cursor = 0
+
+        if not results:
+            self.query_one("#search-status", Static).update("  No skills found. Try a different query.")
+            return
+
+        self.query_one("#search-status", Static).update(
+            f"  [bold]{len(results)} skills found[/bold]"
+        )
+        for s in results[:30]:
+            row = SkillSearchRow(
+                skill_name=s.name,
+                source=s.source,
+                installs=s.installs,
+                installed=s.name in installed_names,
+            )
+            container.mount(row)
+        self._set_search_cursor(0)
+        try:
+            inp = self.query_one("#search-input", Input)
+            if inp.has_focus:
+                inp.blur()
+                self._input_focused = False
+        except Exception:
+            pass
+
+    def _search_skill_rows(self) -> list[SkillSearchRow]:
+        return list(self.query_one("#search-results", ScrollableContainer).query(SkillSearchRow))
+
+    def _show_skill_search_detail(self):
+        """Show detail for a skill search result."""
+        rows = self._search_skill_rows()
+        if not rows or self.search_cursor >= len(rows):
+            return
+        row = rows[self.search_cursor]
+
+        def handle_result(result):
+            if result == "add_user":
+                self._install_skill(row.skill_name, row.source, scope="global")
+            elif result == "add_project":
+                self._install_skill(row.skill_name, row.source, scope="project")
+
+        self.push_screen(SkillSearchDetailScreen(
+            skill_name=row.skill_name,
+            source=row.source,
+            installs=row.installs,
+            installed=row.installed,
+            description=row.description,
+        ), handle_result)
+
+    def _toggle_search_mode(self):
+        """Toggle between MCP and skills search modes."""
+        self.search_mode = "skills" if self.search_mode == "mcps" else "mcps"
+        self._update_search_placeholder()
+        container = self.query_one("#search-results", ScrollableContainer)
+        container.remove_children()
+        self.search_cursor = 0
+        self.query_one("#search-status", Static).update("  [dim]Type a query and press Enter to search[/dim]")
+        self.query_one("#search-sub-nav", Label).update(self._render_search_sub_nav())
+        self.query_one("#tab-bar", Label).update(self._render_tab_bar())
+        self.query_one("#footer-hints", Label).update(self._footer_for_tab())
+        # Update column header for mode
+        col_header = self.query_one("#search-col-header", Label)
+        if self.search_mode == "skills":
+            col_header.update("  [bold]✓[/]  name                       [bold]installs[/]  source / description")
+        else:
+            col_header.update("  [bold]✓[/]  name                       [bold]type[/]   registry / description")
+        inp = self.query_one("#search-input", Input)
+        inp.value = ""
+
+    def _update_search_placeholder(self):
+        inp = self.query_one("#search-input", Input)
+        if self.search_mode == "skills":
+            inp.placeholder = "Search skills (skills.sh)..."
+        else:
+            inp.placeholder = "Search MCP servers (GitHub MCP org + Registry)..."
+
+    def _toggle_discover_mode(self):
+        """Toggle between MCP and skills discover modes."""
+        self.discover_mode = "skills" if self.discover_mode == "mcps" else "mcps"
+        container = self.query_one("#discover-results", ScrollableContainer)
+        container.remove_children()
+        self.discover_cursor = 0
+        self.query_one("#discover-sub-nav", Label).update(self._render_discover_sub_nav())
+        self.query_one("#tab-bar", Label).update(self._render_tab_bar())
+        # Update column header for mode
+        col_header = self.query_one("#discover-col-header", Label)
+        if self.discover_mode == "skills":
+            col_header.update("  [bold]✓[/]  name                       [bold]installs[/]  source / description")
+        else:
+            col_header.update(f"     {'name':<{NAME_WIDTH}}     [bold]★[/]  [bold]lang[/]  description")
+        if self.discover_mode == "mcps":
+            self.discover_view = "categories"
+            self._show_categories()
+        else:
+            self._show_skills_discover()
+        self.query_one("#footer-hints", Label).update(self._footer_for_tab())
+
+    def _show_skills_discover(self):
+        """Show discoverable skills in the discover tab."""
+        self.query_one("#discover-status", Static).update(
+            "  [bold]Discover skills[/bold]  [dim]loading...[/dim]"
+        )
+        thread = Thread(target=self._do_fetch_skills_discover, daemon=True)
+        thread.start()
+
+    def _do_fetch_skills_discover(self):
+        skills = fetch_skills_discover(count=75)
+        installed = get_installed_skills(cwd=self.cwd)
+        self.call_from_thread(self._show_discover_skills_results, skills, installed)
+
+    def _show_discover_skills_results(self, skills: list, installed: list[dict]):
+        installed_names = {s["name"] for s in installed}
+        container = self.query_one("#discover-results", ScrollableContainer)
+        container.remove_children()
+        self.discover_cursor = 0
+
+        filtered = [s for s in skills if s.name not in installed_names]
+        if not filtered:
+            self.query_one("#discover-status", Static).update(
+                "  [bold]Discover skills[/bold]  [dim]no new skills found[/dim]"
+            )
+            return
+
+        self.query_one("#discover-status", Static).update(
+            f"  [bold]Discover skills[/bold]  [dim]{len(filtered)} available[/dim]"
+        )
+        for s in filtered:
+            row = SkillSearchRow(
+                skill_name=s.name,
+                source=s.source,
+                installs=s.installs,
+                installed=False,
+            )
+            container.mount(row)
+        self._set_discover_cursor(0)
+
+    def _navigable_discover_skill_rows(self) -> list[SkillSearchRow]:
+        container = self.query_one("#discover-results", ScrollableContainer)
+        return [w for w in container.children if isinstance(w, SkillSearchRow)]
+
     def on_key(self, event):
         # Don't handle keys when a modal screen is on top
         if len(self.screen_stack) > 1:
@@ -1647,35 +2578,44 @@ class ManCPApp(App):
         # -- Servers tab --
         if self.active_tab == "servers":
             if event.key in ("right", "l"):
-                self._switch_tab("search")
+                self._switch_tab("skills")
                 event.stop()
                 event.prevent_default()
             return
 
         # -- Search tab --
         if self.active_tab == "search":
+            # tab always toggles MCPs/Skills mode
+            if event.key == "tab":
+                self._toggle_search_mode()
+                event.stop()
+                event.prevent_default()
+                return
+
             if is_input:
                 inp = self.query_one("#search-input", Input)
-                if event.key in ("tab", "down"):
-                    if self._search_result_rows():
+                has_rows = (self._search_result_rows() if self.search_mode == "mcps"
+                           else self._search_skill_rows())
+                if event.key == "down":
+                    if has_rows:
                         inp.blur()
                         self._input_focused = False
                         self._set_search_cursor(self.search_cursor)
-                        event.stop()
-                        event.prevent_default()
+                    event.stop()
+                    event.prevent_default()
                 elif event.key == "right" and not inp.value:
                     self._switch_tab("discover")
                     event.stop()
                     event.prevent_default()
                 elif event.key == "left" and not inp.value:
-                    self._switch_tab("servers")
+                    self._switch_tab("skills")
                     event.stop()
                     event.prevent_default()
                 elif event.key == "escape":
                     if inp.value:
                         inp.value = ""
                     else:
-                        self._switch_tab("servers")
+                        self._switch_tab("skills")
                     event.stop()
                     event.prevent_default()
                 return
@@ -1690,14 +2630,22 @@ class ManCPApp(App):
                 else:
                     self._set_search_cursor(self.search_cursor - 1)
             elif event.key == "enter":
-                self._show_search_detail()
-            elif event.key in ("left", "h"):
-                self._switch_tab("servers")
-            elif event.key in ("right",):
-                self._switch_tab("discover")
-            elif event.key == "tab":
-                self.query_one("#search-input", Input).focus()
-                self._input_focused = True
+                if self.search_mode == "skills":
+                    self._show_skill_search_detail()
+                else:
+                    self._show_search_detail()
+            elif event.key == "u" and self.search_mode == "skills":
+                rows = self._search_skill_rows()
+                if rows and self.search_cursor < len(rows):
+                    row = rows[self.search_cursor]
+                    if not row.installed:
+                        self._install_skill(row.skill_name, row.source, scope="global")
+            elif event.key == "p" and self.search_mode == "skills":
+                rows = self._search_skill_rows()
+                if rows and self.search_cursor < len(rows):
+                    row = rows[self.search_cursor]
+                    if not row.installed:
+                        self._install_skill(row.skill_name, row.source, scope="project")
             elif event.key in ("q", "escape"):
                 self._switch_tab("servers")
             event.stop()
@@ -1706,74 +2654,107 @@ class ManCPApp(App):
 
         # -- Discover tab --
         if self.active_tab == "discover":
-            if event.key in ("j", "down"):
-                self._set_discover_cursor(self.discover_cursor + 1)
-            elif event.key in ("k", "up"):
-                self._set_discover_cursor(self.discover_cursor - 1)
-            elif event.key == "enter":
-                self._discover_enter()
-            elif event.key in ("left", "h"):
-                self._switch_tab("search")
-            elif event.key in ("right",):
-                self._switch_tab("skills")
-            elif event.key == "r":
-                self._show_categories()
-            elif event.key == "escape":
-                self._discover_back()
-            elif event.key == "q":
-                self._switch_tab("servers")
+            # tab always toggles MCPs/Skills mode
+            if event.key == "tab":
+                self._toggle_discover_mode()
+                event.stop()
+                event.prevent_default()
+                return
+
+            if self.discover_mode == "skills":
+                # Skills discover mode
+                if event.key in ("j", "down"):
+                    rows = self._navigable_discover_skill_rows()
+                    if rows:
+                        self.discover_cursor = min(self.discover_cursor + 1, len(rows) - 1)
+                        for r in rows:
+                            r.focused = False
+                        rows[self.discover_cursor].focused = True
+                        rows[self.discover_cursor].scroll_visible()
+                elif event.key in ("k", "up"):
+                    rows = self._navigable_discover_skill_rows()
+                    if rows:
+                        self.discover_cursor = max(0, self.discover_cursor - 1)
+                        for r in rows:
+                            r.focused = False
+                        rows[self.discover_cursor].focused = True
+                        rows[self.discover_cursor].scroll_visible()
+                elif event.key == "enter":
+                    rows = self._navigable_discover_skill_rows()
+                    if rows and self.discover_cursor < len(rows):
+                        row = rows[self.discover_cursor]
+                        def handle_result(result, _row=row):
+                            if result == "add_user":
+                                self._install_skill(_row.skill_name, _row.source, scope="global")
+                            elif result == "add_project":
+                                self._install_skill(_row.skill_name, _row.source, scope="project")
+                        self.push_screen(SkillSearchDetailScreen(
+                            skill_name=row.skill_name,
+                            source=row.source,
+                            installs=row.installs,
+                            installed=row.installed,
+                        ), handle_result)
+                elif event.key == "u":
+                    rows = self._navigable_discover_skill_rows()
+                    if rows and self.discover_cursor < len(rows):
+                        row = rows[self.discover_cursor]
+                        if not row.installed:
+                            self._install_skill(row.skill_name, row.source, scope="global")
+                elif event.key == "p":
+                    rows = self._navigable_discover_skill_rows()
+                    if rows and self.discover_cursor < len(rows):
+                        row = rows[self.discover_cursor]
+                        if not row.installed:
+                            self._install_skill(row.skill_name, row.source, scope="project")
+                elif event.key in ("left", "h"):
+                    self._switch_tab("search")
+                elif event.key in ("q", "escape"):
+                    self._switch_tab("servers")
+            else:
+                # MCP discover mode
+                if event.key in ("j", "down"):
+                    self._set_discover_cursor(self.discover_cursor + 1)
+                elif event.key in ("k", "up"):
+                    self._set_discover_cursor(self.discover_cursor - 1)
+                elif event.key == "enter":
+                    self._discover_enter()
+                elif event.key in ("left", "h"):
+                    self._switch_tab("search")
+                elif event.key == "r":
+                    self._show_categories()
+                elif event.key == "escape":
+                    self._discover_back()
+                elif event.key == "q":
+                    self._switch_tab("servers")
             event.stop()
             event.prevent_default()
             return
 
         # -- Skills tab --
         if self.active_tab == "skills":
-            if is_input:
-                inp = self.query_one("#skills-search-input", Input)
-                if event.key in ("tab", "down"):
-                    if self._navigable_skill_rows():
-                        inp.blur()
-                        self._input_focused = False
-                        self._set_skills_cursor(self.skills_cursor)
-                        event.stop()
-                        event.prevent_default()
-                elif event.key == "left" and not inp.value:
-                    self._switch_tab("discover")
-                    event.stop()
-                    event.prevent_default()
-                elif event.key == "escape":
-                    if inp.value:
-                        inp.value = ""
-                        # Reload default skills view
-                        self.skills_loaded = False
-                        self._load_skills()
-                    else:
-                        self._switch_tab("discover")
-                    event.stop()
-                    event.prevent_default()
-                return
-
-            # Results browsing (input not focused)
             if event.key in ("j", "down"):
                 self._set_skills_cursor(self.skills_cursor + 1)
             elif event.key in ("k", "up"):
-                if self.skills_cursor == 0:
-                    self.query_one("#skills-search-input", Input).focus()
-                    self._input_focused = True
-                else:
-                    self._set_skills_cursor(self.skills_cursor - 1)
+                self._set_skills_cursor(max(0, self.skills_cursor - 1))
             elif event.key == "enter":
                 self._skills_enter()
             elif event.key == "d":
                 rows = self._navigable_skill_rows()
                 current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
-                if isinstance(current, SkillRow) and current.installed:
+                if isinstance(current, SkillRow):
                     self._remove_skill(current)
+            elif event.key == "space":
+                rows = self._navigable_skill_rows()
+                current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
+                if isinstance(current, SkillRow):
+                    self._toggle_skill_enabled(current)
+            elif event.key == "s":
+                # No-op for skills (changes are applied immediately)
+                self._notify("  [dim]Skills changes are saved automatically[/dim]")
             elif event.key in ("left", "h"):
-                self._switch_tab("discover")
-            elif event.key == "tab":
-                self.query_one("#skills-search-input", Input).focus()
-                self._input_focused = True
+                self._switch_tab("servers")
+            elif event.key in ("right",):
+                self._switch_tab("search")
             elif event.key in ("q", "escape"):
                 self._switch_tab("servers")
             event.stop()
@@ -1827,10 +2808,14 @@ class ManCPApp(App):
         cat_labels = {
             "cloud": "cloud connectors (claude.ai)",
             "user_mcp": "user MCPs (~/.claude/.mcp.json)",
+            "desktop": "Claude Desktop MCPs",
+            "desktop_ext": "Claude Desktop extensions",
         }
         cat_hints = {
             "cloud": "manage at [bold]claude.ai/settings[/bold] or [bold]/mcp[/bold] in Claude Code",
             "user_mcp": "edit directly or [bold]claude mcp remove <name> -s user[/bold]",
+            "desktop": "press [bold]Enter[/bold] to view, [bold]I[/bold] to import into store",
+            "desktop_ext": "managed by Claude Desktop",
         }
 
         for cat_key, entries in cats.items():
@@ -1839,14 +2824,26 @@ class ManCPApp(App):
                 classes="readonly-header",
             )
             for name, status in sorted(entries.items()):
-                yield ReadOnlyRow(name, status, tool_count=self._tool_count_for(name))
+                # Pass config for desktop MCPs so they can be imported
+                cfg = None
+                tc = self._tool_count_for(name)
+                if cat_key == "desktop":
+                    cfg = self.desktop_mcp_configs.get(name, {})
+                elif cat_key == "desktop_ext":
+                    ext = self.desktop_extensions.get(name, {})
+                    tc = ext.get("tool_count", 0) or tc
+                yield ReadOnlyRow(name, status, tool_count=tc, mcp_cfg=cfg)
             yield Label(
                 f"  [dim]{cat_hints[cat_key]}[/dim]",
                 classes="readonly-hint",
             )
 
-    def _focusable_rows(self) -> list[MCPRow | PluginRow]:
-        return list(self.query(MCPRow)) + list(self.query(PluginRow))
+    def _focusable_rows(self) -> list[MCPRow | PluginRow | ReadOnlyRow]:
+        container = self.query_one("#mcp-list", ScrollableContainer)
+        return [
+            w for w in container.children
+            if isinstance(w, (MCPRow, PluginRow, ReadOnlyRow))
+        ]
 
     def _rows(self) -> list[MCPRow]:
         return list(self.query(MCPRow))
@@ -1872,46 +2869,118 @@ class ManCPApp(App):
             return
         self._set_cursor(self.cursor + 1)
 
-    def _current_row(self) -> MCPRow | PluginRow | None:
+    def _current_row(self) -> MCPRow | PluginRow | ReadOnlyRow | None:
         rows = self._focusable_rows()
         if rows and self.cursor < len(rows):
             return rows[self.cursor]
         return None
 
     def action_toggle_user(self):
-        if self.active_tab != "servers":
-            return
-        row = self._current_row()
-        if isinstance(row, MCPRow):
-            row.toggle_user()
-        elif isinstance(row, PluginRow):
-            row.toggle_enabled()
+        if self.active_tab == "servers":
+            row = self._current_row()
+            if isinstance(row, MCPRow):
+                row.toggle_user()
+            elif isinstance(row, PluginRow):
+                row.toggle_enabled()
+        elif self.active_tab == "skills":
+            rows = self._navigable_skill_rows()
+            current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
+            if isinstance(current, SkillRow):
+                if current.in_user or current.in_project:
+                    if not current.in_user:
+                        self._install_skill(current.skill_name, current.source, scope="global")
+                    else:
+                        if current.in_project:
+                            self._remove_skill_scope(current, "global")
+                        else:
+                            self._notify(
+                                "  [dim]Can't remove from user scope — it's the only scope[/dim]"
+                            )
 
     def action_toggle_project(self):
-        if self.active_tab != "servers":
-            return
-        row = self._current_row()
-        if isinstance(row, MCPRow):
-            row.toggle_project()
+        if self.active_tab == "servers":
+            row = self._current_row()
+            if isinstance(row, MCPRow):
+                row.toggle_project()
+        elif self.active_tab == "skills":
+            rows = self._navigable_skill_rows()
+            current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
+            if isinstance(current, SkillRow):
+                if current.in_user or current.in_project:
+                    if not current.in_project:
+                        self._install_skill(current.skill_name, current.source, scope="project")
+                    else:
+                        if current.in_user:
+                            self._remove_skill_scope(current, "project")
+                        else:
+                            self._notify(
+                                "  [dim]Can't remove from project scope — it's the only scope[/dim]"
+                            )
 
     def action_toggle_enabled(self):
-        if self.active_tab != "servers":
-            return
-        row = self._current_row()
-        if isinstance(row, PluginRow):
-            row.toggle_enabled()
+        if self.active_tab == "servers":
+            row = self._current_row()
+            if isinstance(row, PluginRow):
+                row.toggle_enabled()
+        elif self.active_tab == "skills":
+            rows = self._navigable_skill_rows()
+            current = rows[self.skills_cursor] if rows and self.skills_cursor < len(rows) else None
+            if isinstance(current, SkillRow):
+                self._toggle_skill_enabled(current)
 
     def action_select_or_detail(self):
         if self.active_tab == "servers":
             row = self._current_row()
-            if not isinstance(row, MCPRow):
-                return
+            if isinstance(row, MCPRow):
+                def handle_result(result):
+                    if result == "delete":
+                        self._confirm_delete()
 
-            def handle_result(result):
-                if result == "delete":
-                    self._confirm_delete()
+                all_tools = get_mcp_tool_names(self.claude_dir)
+                permitted = all_tools.get(row.mcp_name, all_tools.get(row.mcp_name.replace("-", "_"), []))
+                self.push_screen(DetailScreen(row.mcp_name, row.mcp_cfg, permitted_tools=permitted), handle_result)
+            elif isinstance(row, PluginRow):
+                all_tools = get_mcp_tool_names(self.claude_dir)
+                # Plugin tools use pattern: mcp__plugin_{Name}_{name}__tool
+                name_key = f"plugin_{row.display_name}_{row.display_name}"
+                permitted = all_tools.get(name_key, [])
 
-            self.push_screen(DetailScreen(row.mcp_name, row.mcp_cfg), handle_result)
+                def handle_plugin_result(result, _row=row):
+                    if result == "toggle":
+                        _row.toggle_enabled()
+                    elif result == "delete":
+                        self._confirm_delete()
+
+                self.push_screen(
+                    PluginDetailScreen(row.plugin_id, row.enabled, self.claude_dir, permitted_tools=permitted),
+                    handle_plugin_result,
+                )
+            elif isinstance(row, ReadOnlyRow):
+                all_tools = get_mcp_tool_names(self.claude_dir)
+                # Try different name patterns for cloud connectors
+                name_key = row.mcp_name.replace("claude.ai ", "claude_ai_").replace(" ", "_")
+                permitted = all_tools.get(name_key, all_tools.get(row.mcp_name.replace("-", "_"), []))
+                importable = row.status.startswith("desktop") and not row.status.endswith("extension")
+                needs_auth = row.status == "needs auth"
+
+                def handle_readonly_result(result, _row=row):
+                    if result == "import" and _row.mcp_cfg:
+                        self._import_desktop_mcp(_row.mcp_name, _row.mcp_cfg)
+                    elif result == "auth_started":
+                        self.notify(f"Authenticating {_row.mcp_name} — check your browser")
+
+                claude_json = self.claude_json if self.claude_json else None
+                self.push_screen(
+                    DetailScreen(row.mcp_name, row.mcp_cfg, permitted_tools=permitted, readonly=True, importable=importable, needs_auth=needs_auth, claude_dir=self.claude_dir, claude_json=claude_json),
+                    handle_readonly_result,
+                )
+
+    def action_import_desktop(self):
+        if self.active_tab != "servers":
+            return
+        row = self._current_row()
+        if isinstance(row, ReadOnlyRow) and row.status == "desktop" and row.mcp_cfg:
+            self._import_desktop_mcp(row.mcp_name, row.mcp_cfg)
 
     def action_delete(self):
         if self.active_tab != "servers":
@@ -1983,8 +3052,8 @@ class ManCPApp(App):
             container.mount(widget)
         for widget in self._readonly_widgets():
             container.mount(widget)
-        total_focusable = len(self.names) + len(self.plugin_ids)
-        self._set_cursor(min(self.cursor, total_focusable - 1))
+        total_focusable = len(self._focusable_rows())
+        self._set_cursor(min(self.cursor, max(0, total_focusable - 1)))
 
     def action_apply(self):
         if self.active_tab != "servers":
